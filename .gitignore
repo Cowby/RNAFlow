@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Pytest
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pretrained model weights (large files — download separately)
+checkpoints/
+*.zip
+
+# External dependencies (cloned repos)
+external/
+
+# Optimization results (generated per-run)
+results/
+
+# Claude Code internals
+.claude/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Torch serialized files
+*.pt
+*.pth
+*.ckpt

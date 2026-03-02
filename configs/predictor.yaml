@@ -1,0 +1,20 @@
+# Configuration for training the cell-type-conditioned predictor
+
+# Data
+embeddings: data/embeddings.pt   # precomputed RiboNN embeddings (or use --synthetic)
+
+# Model
+latent_dim: 64
+n_cell_types: 5
+cell_embed_dim: 16
+hidden_dims: [128, 64]
+dropout: 0.2
+
+# Training
+epochs: 50
+batch_size: 128
+lr: 0.001
+
+# Output
+output: checkpoints/predictor.pt
+device: cpu

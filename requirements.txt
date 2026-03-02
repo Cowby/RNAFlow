@@ -1,0 +1,8 @@
+torch>=2.0
+numpy
+pyyaml
+tqdm
+matplotlib
+pytorch-lightning>=2.0
+pandas
+pytest
