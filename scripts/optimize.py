@@ -215,6 +215,12 @@ def main():
                             help="Gradient clipping norm for diffusion guidance")
     diff_group.add_argument("--n-repeats", type=int, default=1,
                             help="Number of independent diffusion runs (keep best)")
+    diff_group.add_argument("--proximity-weight", type=float, default=0.1,
+                            help="Penalty for ||z - seed||²/dim during guidance. "
+                                 "Prevents drift into unrealistic latent regions. 0 = disabled")
+    diff_group.add_argument("--max-radius", type=float, default=50.0,
+                            help="Hard clamp on max distance from seed embedding. "
+                                 "0 = disabled. Default: 50.0")
 
     # ── Gradient inversion ────────────────────────────────────────────────
     inv_group = parser.add_argument_group("Gradient inversion (z* -> sequence)")
@@ -471,6 +477,8 @@ def main():
             init_mu=init_mu,
             n_repeats=args.n_repeats,
             clip_grad_norm=args.clip_grad_norm,
+            proximity_weight=args.proximity_weight,
+            max_radius=args.max_radius,
             device=args.device,
         )
     else:

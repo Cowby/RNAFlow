@@ -103,6 +103,44 @@ def test_diffusion_result_interface():
     assert isinstance(result, DiffusionResult)
 
 
+def test_diffusion_proximity_constrains_distance():
+    """Proximity weight should keep z close to mu_prior."""
+    torch.manual_seed(42)
+
+    # Without proximity: allow drift
+    opt_no_prox = DiffusionOptimizer(
+        dim=4, batch_size=64, n_steps=50, guidance_scale=20.0,
+        proximity_weight=0.0, max_radius=0.0,
+    )
+    res_no_prox = opt_no_prox.optimize(_DiffObjective(target_val=100.0), verbose=False)
+    dist_no_prox = res_no_prox.best_z.norm().item()
+
+    # With proximity: constrained
+    opt_prox = DiffusionOptimizer(
+        dim=4, batch_size=64, n_steps=50, guidance_scale=20.0,
+        proximity_weight=1.0, max_radius=0.0,
+    )
+    res_prox = opt_prox.optimize(_DiffObjective(target_val=100.0), verbose=False)
+    dist_prox = res_prox.best_z.norm().item()
+
+    # Proximity should keep z closer to origin
+    assert dist_prox < dist_no_prox
+
+
+def test_diffusion_max_radius_clamps():
+    """Max radius should enforce a hard distance bound."""
+    torch.manual_seed(42)
+    radius = 5.0
+    opt = DiffusionOptimizer(
+        dim=4, batch_size=64, n_steps=50, guidance_scale=20.0,
+        proximity_weight=0.0, max_radius=radius,
+    )
+    result = opt.optimize(_DiffObjective(target_val=100.0), verbose=False)
+
+    # Best z should be within max_radius of origin (mu_prior = 0)
+    assert result.best_z.norm().item() <= radius + 0.1  # small tolerance
+
+
 def test_diffusion_reset():
     opt = DiffusionOptimizer(dim=4, batch_size=16, n_steps=10)
     opt.optimize(_DiffObjective(), verbose=False)

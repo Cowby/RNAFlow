@@ -196,6 +196,8 @@ These parameters are only used when `--optimizer diffusion`. The `--pop-size` an
 | `--diffusion-steps` | `n_iters` | Number of diffusion timesteps T. Defaults to `--n-iters` if not set. More steps = finer denoising but slower. **50-100**: Quick test. **200**: Standard. |
 | `--clip-grad-norm` | `1.0` | Per-sample gradient clipping norm. Prevents large gradients from destabilizing the reverse process. **0**: Disabled. **1.0** (default): Standard clipping. |
 | `--n-repeats` | `1` | Run the reverse diffusion process this many times independently, keeping the best result. Useful for escaping bad random seeds. **1**: Standard. **3-5**: More robust but proportionally slower. |
+| `--proximity-weight` | `0.1` | Penalizes `\|\|z - seed\|\|² / dim` during guidance, preventing drift into unrealistic latent regions where the head_tail extrapolates linearly but inversion fails. **0**: Disabled (can cause overshoot). **0.1** (default): Good balance. **0.5+**: Conservative, stays very close to seed. |
+| `--max-radius` | `50.0` | Hard distance clamp from seed embedding. Samples beyond this radius are projected back. Acts as a safety net. **0**: Disabled. **50** (default): Matches typical FlowCEM exploration range. |
 
 ### Gradient Inversion (z* -> sequence)
 
@@ -575,6 +577,8 @@ noise_schedule: cosine
 diffusion_steps: null            # defaults to n_iters
 clip_grad_norm: 1.0
 n_repeats: 1
+proximity_weight: 0.1            # prevents drift from seed
+max_radius: 50.0                 # hard distance clamp
 
 inversion_steps: 500
 inversion_lr: 0.05

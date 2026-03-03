@@ -54,6 +54,10 @@ class DiffusionOptimizer:
         init_sigma: Prior std (unused in diffusion, kept for interface compat).
         n_repeats: Number of independent reverse diffusion runs (keep best).
         clip_grad_norm: Maximum gradient norm per sample for stability.
+        proximity_weight: Penalizes ||z - mu_prior||² / dim during guidance.
+            Prevents drift into unrealistic latent regions. 0 = disabled.
+        max_radius: Hard clamp on distance from mu_prior. Samples beyond this
+            are projected back. 0 = disabled.
         device: Torch device.
     """
 
@@ -68,6 +72,8 @@ class DiffusionOptimizer:
         init_sigma: Tensor | None = None,
         n_repeats: int = 1,
         clip_grad_norm: float = 1.0,
+        proximity_weight: float = 0.1,
+        max_radius: float = 50.0,
         device: str = "cpu",
     ):
         self.dim = dim
@@ -77,6 +83,8 @@ class DiffusionOptimizer:
         self.noise_schedule = noise_schedule
         self.n_repeats = n_repeats
         self.clip_grad_norm = clip_grad_norm
+        self.proximity_weight = proximity_weight
+        self.max_radius = max_radius
         self.device = torch.device(device)
 
         self.mu_prior = (
@@ -183,8 +191,13 @@ class DiffusionOptimizer:
         eps_hat = (z_t - sqrt_ab * self.mu_prior.unsqueeze(0)) / sqrt_1_ab
 
         # Classifier guidance: compute gradient of objective w.r.t. z_t
+        # Include proximity penalty to prevent drift from realistic latent region
         z_t_grad = z_t.detach().requires_grad_(True)
         scores = self._objective_with_grad(z_t_grad, objective_fn)
+        if self.proximity_weight > 0:
+            displacement = z_t_grad - self.mu_prior.unsqueeze(0)
+            proximity_penalty = (displacement ** 2).sum(dim=1) / self.dim
+            scores = scores - self.proximity_weight * proximity_penalty
         grad = torch.autograd.grad(scores.sum(), z_t_grad)[0]
 
         # Per-sample gradient clipping for stability
@@ -193,13 +206,17 @@ class DiffusionOptimizer:
             clip_coef = (self.clip_grad_norm / grad_norms).clamp(max=1.0)
             grad = grad * clip_coef
 
-        # Guided noise estimate
-        eps_guided = eps_hat - sqrt_1_ab * self.guidance_scale * grad
+        # Apply guidance directly to the reverse mean (more stable than
+        # modifying the noise estimate, which gets amplified)
+        eps_unguided = eps_hat
 
-        # DDPM reverse mean
+        # DDPM reverse mean (unguided denoising)
         mean = (1.0 / alpha_t.sqrt()) * (
-            z_t - (beta_t / sqrt_1_ab) * eps_guided
+            z_t - (beta_t / sqrt_1_ab) * eps_unguided
         )
+
+        # Add guidance as a step-size-modulated gradient ascent term
+        mean = mean + self.guidance_scale * beta_t * grad
 
         # Add stochastic noise (except at final step)
         if t > 0:
@@ -208,6 +225,13 @@ class DiffusionOptimizer:
             z_next = mean + sigma_t * noise
         else:
             z_next = mean
+
+        # Hard clamp: project back if beyond max_radius from prior
+        if self.max_radius > 0:
+            displacement = z_next - self.mu_prior.unsqueeze(0)
+            dist = displacement.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            scale = (self.max_radius / dist).clamp(max=1.0)
+            z_next = self.mu_prior.unsqueeze(0) + displacement * scale
 
         return z_next.detach()
 
@@ -254,10 +278,14 @@ class DiffusionOptimizer:
                 )
 
                 if verbose and (self.n_steps - 1 - t) % 10 == 0:
+                    mean_dist = (z_t - self.mu_prior.unsqueeze(0)).norm(
+                        dim=1
+                    ).mean().item()
                     print(
                         f"[Diffusion] Step {self.n_steps - t:4d}/{self.n_steps} "
                         f"(repeat {repeat + 1}/{self.n_repeats}) | "
                         f"score={global_best_score:.4f} | "
+                        f"dist={mean_dist:.1f} | "
                         f"noise={self.sqrt_one_minus_alpha_bars[t]:.4f}"
                     )
 

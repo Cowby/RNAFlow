@@ -28,6 +28,8 @@ noise_schedule: cosine           # beta schedule: cosine or linear
 diffusion_steps: null            # timesteps (defaults to n_iters)
 clip_grad_norm: 1.0              # gradient clipping for stability
 n_repeats: 1                     # independent diffusion runs (keep best)
+proximity_weight: 0.1            # penalizes drift from seed (||z-mu||²/dim). 0 = disabled
+max_radius: 50.0                 # hard clamp on distance from seed. 0 = disabled
 
 # Inversion
 seq_len: 2048                   # length of generated sequence
