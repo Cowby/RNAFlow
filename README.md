@@ -2,7 +2,7 @@
 
 **Flow-inspired latent space optimization of mRNA sequences for cell-type specificity.**
 
-RNAFlow uses [RiboNN](https://github.com/Sanofi-Public/RiboNN) pretrained embeddings and a flow-inspired Cross-Entropy Method (FlowCEM) to optimize mRNA sequences in a 64-dimensional latent space, maximizing translation efficiency in a target cell type while suppressing off-target expression.
+RNAFlow uses [RiboNN](https://github.com/Sanofi-Public/RiboNN) pretrained embeddings and a flow-inspired Cross-Entropy Method (FlowCEM) to optimize mRNA sequences in a 64-dimensional latent space, maximizing translation efficiency in a target cell type while suppressing off-target expression. It also includes a **latent diffusion optimizer** that uses DDPM-style reverse diffusion with classifier guidance, exploiting gradients from the differentiable objective for potentially stronger optimization.
 
 ## Overview
 
@@ -10,11 +10,13 @@ RNAFlow uses [RiboNN](https://github.com/Sanofi-Public/RiboNN) pretrained embedd
 Your mRNA (5'UTR + CDS + 3'UTR)
          │
          ▼
-    RiboNN encoder ──> 64-dim latent z  (= CEM starting point)
+    RiboNN encoder ──> 64-dim latent z  (= optimizer starting point)
                              │
-                        FlowCEM optimizer
-                        (CEM + flow schedule)
-                             │
+                    ┌────────┴────────┐
+               FlowCEM            Diffusion
+            (CEM + flow       (DDPM + classifier
+              schedule)          guidance)
+                    └────────┬────────┘
                         optimized z*
                              │
                     gradient-based inversion
@@ -25,7 +27,7 @@ Your mRNA (5'UTR + CDS + 3'UTR)
 
 **Key idea:** Instead of optimizing over discrete nucleotide sequences directly, RNAFlow:
 1. Embeds your input mRNA into RiboNN's 64-dim bottleneck space
-2. Runs CEM optimization with flow-inspired distribution interpolation to find a latent vector z* that maximizes target-cell specificity
+2. Runs optimization (FlowCEM or latent diffusion) to find a latent vector z* that maximizes target-cell specificity
 3. Inverts z* back to a nucleotide sequence via gradient descent, using your CDS structure for proper codon labeling
 
 ## Installation
@@ -93,7 +95,7 @@ The script will:
 - Build proper codon labels from your CDS during gradient inversion
 - Auto-detect `seq_len` from the model (typically 13,312 nt)
 
-**About the pretrained models:** The Zenodo download contains 91 independently trained model runs (cross-validation folds). Auto-detection picks the first one alphabetically. To use a specific run: `--ribonn-state-dict checkpoints/human/<run_id>/state_dict.pth`
+**About the pretrained models:** The Zenodo download contains 91 independently trained model runs (nested cross-validation: 10 test folds x 9 validation folds). Every model predicts all 78 cell types. By default, RNAFlow loads the **top 5 models by validation R²** and ensembles them by averaging predictions — matching the RiboNN authors' recommended approach. To use a single model: `--ensemble-size 0` or `--ribonn-state-dict checkpoints/human/<run_id>/state_dict.pth`
 
 ### 3. Or use a FASTA file
 
@@ -144,6 +146,7 @@ python scripts/optimize.py \
 | `--ribonn-checkpoint PATH` | — | Alternative: path to a PyTorch Lightning `.ckpt` file (if you trained RiboNN yourself). |
 | `--predictor-checkpoint PATH` | — | Path to a trained custom predictor `.pt` file (only for `--objective predictor`). |
 | `--use-mock` | — | Use a random-weight MockRiboNN for testing. No pretrained weights needed. |
+| `--ensemble-size N` | `5` | Number of top models (by val_r2) to ensemble. Matches the RiboNN authors' recommended approach. **0**: Use a single model (legacy behavior). **5** (default): Top 5 by validation R². **10+**: More models, diminishing returns. |
 
 ### Sequence Input
 
@@ -171,16 +174,28 @@ You provide your mRNA structure so that RNAFlow can (a) start optimization near 
 | `--off-target-cells` | `HEK293T K562 A549 MCF7` | Cell types to suppress. The objective penalizes high TE in these. More off-targets = stronger constraint on the optimization. |
 | `--lam` | `1.0` | Controls the strength of off-target suppression. The objective is `TE[target] - lam * mean(TE[off_targets])`. **lam=0**: Maximize target only, ignore off-targets. **lam=1**: Equal weight to target and off-target suppression. **lam=5-10**: Aggressively suppress off-targets, even at some cost to target TE. Start with 1.0 and increase if off-target suppression is insufficient. |
 
-### CEM Optimizer
+### Optimizer
 
 | Parameter | Default | What it does |
 |-----------|---------|--------------|
-| `--optimizer` | `flow` | **`flow`** (FlowCEM): Interpolates the sampling distribution from a broad prior toward the elite-fitted distribution using a time schedule. Better exploration-exploitation balance. **`vanilla`**: Standard CEM that immediately fits to elites each iteration. Faster convergence but more prone to getting stuck in local optima. Use `vanilla` as a baseline for comparison. |
+| `--optimizer` | `flow` | **`flow`** (FlowCEM): Interpolates the sampling distribution from a broad prior toward the elite-fitted distribution using a time schedule. Better exploration-exploitation balance. **`vanilla`**: Standard CEM that immediately fits to elites each iteration. Faster convergence but more prone to getting stuck in local optima. **`diffusion`**: DDPM-style reverse diffusion with classifier guidance. Uses gradients from the differentiable objective to steer sampling — the only optimizer that exploits gradient information during latent space search. |
 | `--pop-size` | `512` | Number of candidate latent vectors sampled per iteration. **Larger (1024+)**: Better coverage of latent space, less likely to miss good solutions. Costs linearly more compute per iteration. **Smaller (128)**: Faster iterations but noisier elite estimates. Good for quick exploration or when compute is limited. For 64-dim latent space, 256-512 is a good balance. |
 | `--elite-frac` | `0.05` | Fraction of top-scoring samples used to update the distribution. With pop_size=512 and elite_frac=0.05, the top 25 samples are kept. **Smaller (0.01-0.02)**: More selective, faster convergence, but risks losing diversity. **Larger (0.1-0.2)**: More conservative, maintains diversity, slower convergence. If optimization plateaus early, try increasing this. |
 | `--n-iters` | `200` | Number of CEM iterations. Each iteration samples, evaluates, and updates. **50-100**: Quick exploration, good for testing. **200-300**: Standard runs, usually sufficient for convergence. **500+**: Diminishing returns unless the objective landscape is very rugged. Watch the optimization plot: if the score plateaus, more iterations won't help. |
 | `--schedule` | `cosine` | Controls how quickly FlowCEM transitions from exploration to exploitation. **`cosine`** (recommended): Slow start, fast middle, slow end. Gives time to explore early, then converges smoothly. **`linear`**: Uniform transition. Simple and predictable. **`quadratic`**: Spends more time exploring (t grows slowly early). Good if your starting point is far from the optimum. **`sqrt`**: Exploits quickly (t grows fast early). Good if your starting point is already good (e.g., seeded from a known sequence). |
 | `--momentum` | `0.0` | Exponential moving average smoothing for elite mean/sigma updates (0-1). **0.0**: No smoothing, each iteration fully replaces the elite statistics. **0.1-0.3**: Mild smoothing, reduces noise from small elite sets. Useful when pop_size is small or objective is noisy. **0.5+**: Heavy smoothing, very slow adaptation. Rarely needed. |
+
+### Diffusion Optimizer
+
+These parameters are only used when `--optimizer diffusion`. The `--pop-size` and `--n-iters` parameters are shared (batch size and number of steps, respectively).
+
+| Parameter | Default | What it does |
+|-----------|---------|--------------|
+| `--guidance-scale` | `10.0` | Classifier guidance weight. Controls how strongly the objective gradient steers the diffusion process. **1-5**: Mild guidance, more exploration, may undershoot. **10** (default): Good balance. **20-50**: Aggressive guidance, faster convergence but may overshoot or get stuck in sharp local optima. |
+| `--noise-schedule` | `cosine` | Beta schedule for the forward diffusion process. **`cosine`** (recommended): Nichol & Dhariwal schedule, smooth noise ramp. **`linear`**: Standard DDPM linear schedule. |
+| `--diffusion-steps` | `n_iters` | Number of diffusion timesteps T. Defaults to `--n-iters` if not set. More steps = finer denoising but slower. **50-100**: Quick test. **200**: Standard. |
+| `--clip-grad-norm` | `1.0` | Per-sample gradient clipping norm. Prevents large gradients from destabilizing the reverse process. **0**: Disabled. **1.0** (default): Standard clipping. |
+| `--n-repeats` | `1` | Run the reverse diffusion process this many times independently, keeping the best result. Useful for escaping bad random seeds. **1**: Standard. **3-5**: More robust but proportionally slower. |
 
 ### Gradient Inversion (z* -> sequence)
 
@@ -234,7 +249,8 @@ RNAFlow/
 │   │   ├── cell_types.py        # 78 human cell type name <-> index mapping
 │   │   └── synthetic.py         # Synthetic data for testing
 │   ├── embeddings/
-│   │   └── ribonn_wrapper.py    # RiboNN wrapper: embedding extraction + prediction
+│   │   ├── ribonn_wrapper.py    # RiboNN wrapper: embedding extraction + prediction
+│   │   └── ensemble.py          # Ensemble wrapper: top-K models averaged
 │   ├── inversion/
 │   │   └── gradient_decoder.py  # Gradient-based latent -> sequence inversion
 │   ├── models/
@@ -242,6 +258,7 @@ RNAFlow/
 │   ├── optim/
 │   │   ├── cem.py               # Vanilla CEM baseline
 │   │   ├── flow_cem.py          # Flow-inspired CEM (core novelty)
+│   │   ├── diffusion.py         # Latent diffusion optimizer (DDPM + classifier guidance)
 │   │   └── objective.py         # Specificity objective functions
 │   └── utils/
 │       └── config.py            # YAML config loader
@@ -252,7 +269,7 @@ RNAFlow/
 ├── configs/
 │   ├── optimize.yaml            # Optimization config
 │   └── predictor.yaml           # Predictor training config
-└── tests/                       # 33 unit tests
+└── tests/                       # 50+ unit tests
 ```
 
 ### How RiboNN Embeddings Work
@@ -291,6 +308,22 @@ For iteration k = 0, ..., N-1:
 ```
 
 At t=0, sampling comes from the broad prior (wide exploration). At t=1, sampling comes from the elite-fitted distribution (focused exploitation). The schedule controls the transition speed.
+
+### Latent Diffusion Algorithm
+
+The diffusion optimizer uses DDPM-style reverse diffusion with classifier guidance:
+
+```
+Sample z_T ~ N(mu_prior, I)                    # start from noise around seed
+For t = T-1, ..., 0:
+    eps_hat = analytical noise estimate          # from Gaussian prior
+    grad = ∇_z objective(z_t)                    # classifier guidance gradient
+    eps_guided = eps_hat - s * grad              # guide toward high-TE regions
+    z_{t-1} = DDPM_reverse(z_t, eps_guided)     # denoise one step
+Return best z by objective score
+```
+
+Key difference from FlowCEM: the diffusion optimizer computes `∇_z objective(z)` at every step, using the gradient of the differentiable RiboNN head to steer sampling. FlowCEM treats the objective as a black box and relies on population-based elite selection instead.
 
 ### Codon Labels
 
@@ -344,25 +377,32 @@ done
 - **sqrt**: Better when seeded from a known good sequence. Exploits quickly.
 - **linear**: Simple baseline. Uniform transition.
 
-### FlowCEM vs Vanilla CEM
+### FlowCEM vs Vanilla CEM vs Diffusion
 
 ```bash
-# FlowCEM
+# FlowCEM (gradient-free, population-based with flow schedule)
 python scripts/optimize.py \
   --utr5 "..." --cds "AUG...UAA" --utr3 "..." \
   --target-cell HeLa --off-target-cells HEK293T K562 \
   --optimizer flow --schedule cosine \
   --n-iters 200 --output-dir results/flow
 
-# Vanilla CEM
+# Vanilla CEM (gradient-free, population-based, immediate elite collapse)
 python scripts/optimize.py \
   --utr5 "..." --cds "AUG...UAA" --utr3 "..." \
   --target-cell HeLa --off-target-cells HEK293T K562 \
   --optimizer vanilla \
   --n-iters 200 --output-dir results/vanilla
+
+# Diffusion (gradient-guided, DDPM reverse diffusion with classifier guidance)
+python scripts/optimize.py \
+  --utr5 "..." --cds "AUG...UAA" --utr3 "..." \
+  --target-cell HeLa --off-target-cells HEK293T K562 \
+  --optimizer diffusion --guidance-scale 10.0 \
+  --n-iters 200 --output-dir results/diffusion
 ```
 
-FlowCEM typically achieves higher final scores because the gradual transition avoids premature convergence to local optima.
+**FlowCEM** typically outperforms vanilla CEM because the gradual transition avoids premature convergence. **Diffusion** is the only optimizer that uses gradient information from the objective during latent space search, which can provide stronger signal in the 64-dim space — especially when the objective landscape has multiple modes or sharp ridges.
 
 ### Aggressive off-target suppression
 
@@ -499,8 +539,10 @@ Example `results.json`:
 ## Testing
 
 ```bash
-pytest tests/ -v                                    # all 33 tests
-pytest tests/test_flow_cem.py -v                    # optimizer tests only
+pytest tests/ -v                                    # all tests
+pytest tests/test_flow_cem.py -v                    # CEM optimizer tests
+pytest tests/test_diffusion.py -v                   # diffusion optimizer tests
+pytest tests/test_ensemble.py -v                    # ensemble wrapper tests
 pytest tests/ --cov=rnaflow --cov-report=term-missing  # with coverage
 ```
 
@@ -509,21 +551,30 @@ pytest tests/ --cov=rnaflow --cov-report=term-missing  # with coverage
 ### configs/optimize.yaml
 
 ```yaml
-ribonn_checkpoint: null
+ribonn_checkpoint: null          # null = auto-detect from checkpoints/
 predictor_checkpoint: null
-use_mock: true
+use_mock: false                  # set true only for dev/CI
+
+ensemble_size: 5                 # top models to ensemble (by val_r2). 0 = single model
 
 objective: ribonn
 target_cell: HeLa
 off_target_cells: [HEK293T, K562, A549, MCF7]
 lam: 1.0
 
-optimizer: flow
+optimizer: flow                  # 'flow', 'vanilla', or 'diffusion'
 pop_size: 512
 elite_frac: 0.05
 n_iters: 200
 schedule: cosine
 momentum: 0.0
+
+# Diffusion optimizer (used when optimizer: diffusion)
+guidance_scale: 10.0
+noise_schedule: cosine
+diffusion_steps: null            # defaults to n_iters
+clip_grad_norm: 1.0
+n_repeats: 1
 
 inversion_steps: 500
 inversion_lr: 0.05

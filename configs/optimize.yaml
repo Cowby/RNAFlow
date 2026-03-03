@@ -1,23 +1,33 @@
 # Configuration for FlowCEM mRNA optimization
 
 # Models
-ribonn_checkpoint: null          # path to RiboNN .ckpt (null = use mock for testing)
+ribonn_checkpoint: null          # path to RiboNN .ckpt (null = auto-detect from checkpoints/)
 predictor_checkpoint: null       # path to predictor .pt (null = train synthetic)
-use_mock: true                   # use MockRiboNN for testing
+use_mock: false                  # use MockRiboNN for testing (set true only for dev/CI)
+
+# Ensemble
+ensemble_size: 5                 # number of top models to ensemble (by val_r2). 0 = single model
 
 # Objective
-objective: predictor             # 'predictor' or 'ribonn'
-target_cell: 0                   # cell type to maximize TE for
-off_target_cells: [1, 2, 3, 4]  # cell types to minimize TE for
+objective: ribonn                # 'ribonn' (direct head) or 'predictor' (trained MLP)
+target_cell: HeLa                # cell type to maximize TE for
+off_target_cells: [HEK293T, K562, A549, MCF7]  # cell types to minimize TE for
 lam: 1.0                        # off-target penalty weight
 
 # Optimizer
-optimizer: flow                  # 'flow' or 'vanilla'
-pop_size: 512                    # candidates per CEM iteration
-elite_frac: 0.05                # fraction of top samples to keep
-n_iters: 200                    # number of CEM iterations
+optimizer: flow                  # 'flow', 'vanilla', or 'diffusion'
+pop_size: 512                    # candidates per CEM iteration / diffusion batch
+elite_frac: 0.05                # fraction of top samples to keep (CEM only)
+n_iters: 200                    # number of CEM iterations / diffusion steps
 schedule: cosine                 # time schedule: linear, cosine, quadratic, sqrt
 momentum: 0.0                   # EMA smoothing for elite updates
+
+# Diffusion optimizer (used when optimizer: diffusion)
+guidance_scale: 10.0             # classifier guidance weight
+noise_schedule: cosine           # beta schedule: cosine or linear
+diffusion_steps: null            # timesteps (defaults to n_iters)
+clip_grad_norm: 1.0              # gradient clipping for stability
+n_repeats: 1                     # independent diffusion runs (keep best)
 
 # Inversion
 seq_len: 2048                   # length of generated sequence

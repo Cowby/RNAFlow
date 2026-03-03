@@ -52,10 +52,12 @@ from rnaflow.data.cell_types import (
 )
 from rnaflow.data.encoding import one_hot_encode_ribonn
 from rnaflow.embeddings.ribonn_wrapper import RiboNNWrapper, MockRiboNN
+from rnaflow.embeddings.ensemble import EnsembleRiboNNWrapper
 from rnaflow.inversion.gradient_decoder import GradientDecoder
 from rnaflow.models.predictor import TranslationPredictor
 from rnaflow.optim.flow_cem import FlowCEM
 from rnaflow.optim.cem import VanillaCEM
+from rnaflow.optim.diffusion import DiffusionOptimizer
 from rnaflow.optim.objective import PredictorSpecificityObjective, LatentRiboNNObjective
 from rnaflow.data.codon_table import translate
 from rnaflow.utils.config import load_config
@@ -112,6 +114,13 @@ def plot_optimization(result, output_path: str):
         axes[2].set_ylabel("Mean sigma")
         axes[2].set_title("Distribution Width")
 
+    # Noise level (if Diffusion)
+    if hasattr(result, "noise_history") and result.noise_history:
+        axes[2].plot(result.noise_history)
+        axes[2].set_xlabel("Step")
+        axes[2].set_ylabel("Noise level")
+        axes[2].set_title("Diffusion Noise Schedule")
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -142,6 +151,9 @@ def main():
                              help="Path to trained predictor .pt file")
     model_group.add_argument("--use-mock", action="store_true",
                              help="Use MockRiboNN for testing without pretrained weights")
+    model_group.add_argument("--ensemble-size", type=int, default=5,
+                             help="Number of top models (by val_r2) to ensemble. "
+                                  "0 = single model (legacy). Default: 5")
 
     # ── Sequence input ────────────────────────────────────────────────────
     seq_group = parser.add_argument_group(
@@ -177,8 +189,8 @@ def main():
 
     # ── CEM optimizer ─────────────────────────────────────────────────────
     cem_group = parser.add_argument_group("CEM optimizer")
-    cem_group.add_argument("--optimizer", choices=["flow", "vanilla"], default="flow",
-                           help="'flow' = FlowCEM with schedule; 'vanilla' = standard CEM")
+    cem_group.add_argument("--optimizer", choices=["flow", "vanilla", "diffusion"], default="flow",
+                           help="'flow' = FlowCEM; 'vanilla' = standard CEM; 'diffusion' = DDPM with guidance")
     cem_group.add_argument("--pop-size", type=int, default=512,
                            help="Candidates per iteration. Larger = better exploration, slower")
     cem_group.add_argument("--elite-frac", type=float, default=0.05,
@@ -190,6 +202,19 @@ def main():
                            help="Flow time schedule. cosine is recommended for most cases")
     cem_group.add_argument("--momentum", type=float, default=0.0,
                            help="EMA smoothing for elite updates (0-1). >0 stabilizes noisy objectives")
+
+    # ── Diffusion optimizer ──────────────────────────────────────────────
+    diff_group = parser.add_argument_group("Diffusion optimizer (used when --optimizer diffusion)")
+    diff_group.add_argument("--guidance-scale", type=float, default=10.0,
+                            help="Classifier guidance weight. Higher = stronger gradient signal")
+    diff_group.add_argument("--noise-schedule", choices=["cosine", "linear"], default="cosine",
+                            help="Beta schedule for diffusion process")
+    diff_group.add_argument("--diffusion-steps", type=int, default=None,
+                            help="Diffusion timesteps (defaults to --n-iters if not set)")
+    diff_group.add_argument("--clip-grad-norm", type=float, default=1.0,
+                            help="Gradient clipping norm for diffusion guidance")
+    diff_group.add_argument("--n-repeats", type=int, default=1,
+                            help="Number of independent diffusion runs (keep best)")
 
     # ── Gradient inversion ────────────────────────────────────────────────
     inv_group = parser.add_argument_group("Gradient inversion (z* -> sequence)")
@@ -296,35 +321,62 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load models ──────────────────────────────────────────────────────
-    # Auto-detect state_dict if not explicitly provided
-    if not args.use_mock and not args.ribonn_state_dict and not args.ribonn_checkpoint:
-        ckpt_root = Path(args.checkpoints_dir) if args.checkpoints_dir else PROJECT_ROOT / "checkpoints"
-        search_dir = ckpt_root / args.organism
-        if search_dir.exists():
-            candidates = sorted(search_dir.glob("*/state_dict.pth"))
-            if candidates:
-                args.ribonn_state_dict = str(candidates[0])
-                print(f"Auto-detected {args.organism} model: {args.ribonn_state_dict}")
-                if len(candidates) > 1:
-                    print(f"  ({len(candidates)} models available, using first. "
-                          f"Use --ribonn-state-dict to pick a specific one)")
-
     if args.use_mock:
         print("Using MockRiboNN (no pretrained weights)...")
         mock_model = MockRiboNN(seq_len=args.seq_len, num_targets=len(off_target_idxs) + 1)
         wrapper = RiboNNWrapper.from_model(mock_model, device=args.device)
     elif args.ribonn_state_dict:
+        # Explicit single model
         print(f"Loading RiboNN from state_dict: {args.ribonn_state_dict}...")
         wrapper = RiboNNWrapper.from_state_dict(args.ribonn_state_dict, device=args.device)
     elif args.ribonn_checkpoint:
         print(f"Loading RiboNN from checkpoint: {args.ribonn_checkpoint}...")
         wrapper = RiboNNWrapper.from_checkpoint(args.ribonn_checkpoint, device=args.device)
     else:
-        print("ERROR: No pretrained weights found. Either:")
-        print("  1. Download from https://zenodo.org/records/17258709 into checkpoints/")
-        print("  2. Provide --ribonn-state-dict or --ribonn-checkpoint explicitly")
-        print("  3. Use --use-mock for testing without pretrained weights")
-        sys.exit(1)
+        # Auto-detect: try ensemble from checkpoints directory
+        ckpt_root = Path(args.checkpoints_dir) if args.checkpoints_dir else PROJECT_ROOT / "checkpoints"
+        search_dir = ckpt_root / args.organism
+        runs_csv = search_dir / "runs.csv"
+
+        if args.ensemble_size > 0 and search_dir.exists():
+            if runs_csv.exists():
+                print(f"Loading ensemble (top {args.ensemble_size} by val_r2) "
+                      f"from {search_dir}...")
+                wrapper = EnsembleRiboNNWrapper.from_runs_csv(
+                    runs_csv, search_dir,
+                    top_k=args.ensemble_size, device=args.device,
+                )
+            else:
+                candidates = sorted(search_dir.glob("*/state_dict.pth"))
+                if candidates:
+                    print(f"No runs.csv found; loading ensemble of first "
+                          f"{args.ensemble_size} models from {search_dir}...")
+                    wrapper = EnsembleRiboNNWrapper.from_directory(
+                        search_dir,
+                        max_models=args.ensemble_size, device=args.device,
+                    )
+                else:
+                    print("ERROR: No pretrained weights found. Either:")
+                    print("  1. Download from https://zenodo.org/records/17258709 into checkpoints/")
+                    print("  2. Provide --ribonn-state-dict or --ribonn-checkpoint explicitly")
+                    print("  3. Use --use-mock for testing without pretrained weights")
+                    sys.exit(1)
+        elif search_dir.exists():
+            # ensemble_size == 0: single-model fallback
+            candidates = sorted(search_dir.glob("*/state_dict.pth"))
+            if candidates:
+                args.ribonn_state_dict = str(candidates[0])
+                print(f"Auto-detected single {args.organism} model: {args.ribonn_state_dict}")
+                wrapper = RiboNNWrapper.from_state_dict(args.ribonn_state_dict, device=args.device)
+            else:
+                print("ERROR: No pretrained weights found.")
+                sys.exit(1)
+        else:
+            print("ERROR: No pretrained weights found. Either:")
+            print("  1. Download from https://zenodo.org/records/17258709 into checkpoints/")
+            print("  2. Provide --ribonn-state-dict or --ribonn-checkpoint explicitly")
+            print("  3. Use --use-mock for testing without pretrained weights")
+            sys.exit(1)
 
     latent_dim = wrapper.latent_dim
     print(f"  Latent dim: {latent_dim}, Targets: {wrapper.num_targets}")
@@ -390,8 +442,13 @@ def main():
         )
         print(f"  Seed embedding norm: {init_mu.norm():.4f}")
 
-    print(f"\nOptimizer: {args.optimizer.upper()} CEM | "
-          f"pop={args.pop_size} | elite={args.elite_frac} | iters={args.n_iters}")
+    if args.optimizer == "diffusion":
+        diff_steps = args.diffusion_steps or args.n_iters
+        print(f"\nOptimizer: DIFFUSION | batch={args.pop_size} | "
+              f"steps={diff_steps} | guidance={args.guidance_scale}")
+    else:
+        print(f"\nOptimizer: {args.optimizer.upper()} CEM | "
+              f"pop={args.pop_size} | elite={args.elite_frac} | iters={args.n_iters}")
 
     if args.optimizer == "flow":
         optimizer = FlowCEM(
@@ -402,6 +459,18 @@ def main():
             init_mu=init_mu,
             schedule=args.schedule,
             momentum=args.momentum,
+            device=args.device,
+        )
+    elif args.optimizer == "diffusion":
+        optimizer = DiffusionOptimizer(
+            dim=latent_dim,
+            batch_size=args.pop_size,
+            n_steps=args.diffusion_steps or args.n_iters,
+            guidance_scale=args.guidance_scale,
+            noise_schedule=args.noise_schedule,
+            init_mu=init_mu,
+            n_repeats=args.n_repeats,
+            clip_grad_norm=args.clip_grad_norm,
             device=args.device,
         )
     else:

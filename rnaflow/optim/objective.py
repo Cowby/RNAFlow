@@ -89,14 +89,20 @@ class LatentRiboNNObjective:
         self.lam = lam
 
         # Extract the tail of the head (layers 5-7: BN -> Dropout -> Linear)
-        head = wrapper.model.head
-        self.head_tail = nn.Sequential(
-            head[5],  # BatchNorm1d(64)
-            head[6],  # Dropout
-            head[7],  # Linear(64, num_targets)
-        )
-        self.head_tail.eval()
-        self.head_tail.to(wrapper.device)
+        # For ensembles, use pre-extracted head_tails from all models
+        if hasattr(wrapper, 'head_tails'):
+            self.head_tails = wrapper.head_tails
+            self.head_tail = wrapper.head_tails[0]  # compat for diffusion
+        else:
+            self.head_tails = None
+            head = wrapper.model.head
+            self.head_tail = nn.Sequential(
+                head[5],  # BatchNorm1d(64)
+                head[6],  # Dropout
+                head[7],  # Linear(64, num_targets)
+            )
+            self.head_tail.eval()
+            self.head_tail.to(wrapper.device)
 
     @torch.no_grad()
     def __call__(self, z: Tensor) -> Tensor:
@@ -109,7 +115,10 @@ class LatentRiboNNObjective:
             scores: (N,) specificity scores (higher is better).
         """
         z = z.to(self.wrapper.device)
-        te = self.head_tail(z)  # (N, num_targets)
+        if self.head_tails:
+            te = torch.stack([ht(z) for ht in self.head_tails]).mean(dim=0)
+        else:
+            te = self.head_tail(z)  # (N, num_targets)
 
         target_eff = te[:, self.target_col]
         off_target_eff = te[:, self.off_target_cols].mean(dim=1)
