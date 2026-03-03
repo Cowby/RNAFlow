@@ -231,22 +231,6 @@ def main():
     inv_group.add_argument("--inversion-lr", type=float, default=0.05,
                            help="Learning rate for inversion. Too high = unstable, too low = slow")
 
-    # ── Composition constraints ──────────────────────────────────────────
-    comp_group = parser.add_argument_group(
-        "Composition constraints",
-        "Penalize biologically problematic nucleotide compositions during "
-        "gradient inversion. Without these, the optimizer produces skewed "
-        "sequences (e.g., poly-U or poly-A) that are unstable or immunogenic."
-    )
-    comp_group.add_argument("--nuc-targets", type=float, nargs=4, default=None,
-                            metavar=("A", "U", "C", "G"),
-                            help="Target fraction for each nucleotide [A U C G]. "
-                                 "Default: 0.25 0.25 0.25 0.25 (balanced). "
-                                 "Example: --nuc-targets 0.20 0.20 0.30 0.30 for GC-rich")
-    comp_group.add_argument("--composition-weight", type=float, default=5.0,
-                            help="Penalty for composition deviation from targets. "
-                                 "Higher = stricter. 0 = disabled. Default: 5.0")
-
     # ── Objective-aware inversion ────────────────────────────────────────
     obj_inv_group = parser.add_argument_group(
         "Objective-aware inversion",
@@ -513,8 +497,6 @@ def main():
         utr5_size=utr5_size,
         cds_size=cds_size,
         cds_seq=cds_seq if cds_seq else None,
-        nuc_targets=args.nuc_targets,
-        composition_weight=args.composition_weight,
         target_col=target_cell_idx,
         off_target_cols=off_target_idxs,
         obj_weight=args.obj_weight,
@@ -761,8 +743,6 @@ def main():
         "gc_content": gc_frac,
         "u_content": u_frac,
         "composition": counts,
-        "nuc_targets": args.nuc_targets or [0.25, 0.25, 0.25, 0.25],
-        "composition_weight": args.composition_weight,
         "obj_weight": args.obj_weight,
         "predictions": {
             "optimized": {ct_name: opt_te[ct_idx].item()

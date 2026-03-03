@@ -145,10 +145,6 @@ class GradientDecoder:
         cds_size: Length of CDS including start+stop codons.
         cds_seq: Actual CDS nucleotide sequence. When provided, CDS positions
             are constrained to synonymous codon substitutions only.
-        nuc_targets: Target fraction for each nucleotide [A, U, C, G].
-            Default [0.25, 0.25, 0.25, 0.25] (balanced).
-        composition_weight: Penalty for nucleotide composition deviation.
-            Loss = weight * sum((actual_i - target_i)^2 for each nucleotide).
         target_col: Index of the target cell type in RiboNN output.
         off_target_cols: Indices of off-target cell types.
         obj_weight: Weight for the objective loss during inversion.
@@ -171,8 +167,6 @@ class GradientDecoder:
         utr5_size: int = 0,
         cds_size: int = 0,
         cds_seq: str | None = None,
-        nuc_targets: list[float] | None = None,
-        composition_weight: float = 5.0,
         target_col: int | None = None,
         off_target_cols: list[int] | None = None,
         obj_weight: float = 1.0,
@@ -189,12 +183,6 @@ class GradientDecoder:
         self.l2_weight = l2_weight
         self.utr5_size = utr5_size
         self.cds_size = cds_size
-        # Nucleotide composition targets: [A, U, C, G]
-        self.nuc_targets = torch.tensor(
-            nuc_targets if nuc_targets else [0.25, 0.25, 0.25, 0.25],
-            dtype=torch.float32,
-        )
-        self.composition_weight = composition_weight
         # Objective-aware inversion parameters
         self.target_col = target_col
         self.off_target_cols = off_target_cols or []
@@ -407,41 +395,21 @@ class GradientDecoder:
             if utr_logits is not None:
                 ent_loss = sequence_entropy(utr_logits)
 
-            # Nucleotide composition loss — UTR positions only
-            # Uses LOCAL (windowed) composition to prevent homopolymer runs.
-            # A global average allows the optimizer to concentrate one base in
-            # long stretches while compensating elsewhere.
-            # Channel order: A=0, U=1, C=2, G=3
-            targets = self.nuc_targets.to(self.device)
-            if utr_logits is not None and utr_total > 0:
-                utr_soft = F.softmax(utr_logits, dim=0)  # (4, utr_total)
-
-                # Local composition in sliding windows
-                window = min(100, utr_total)
-                if utr_total >= window:
-                    # avg_pool1d expects (N, C, L) — use utr_soft as (1, 4, L)
-                    local_fracs = F.avg_pool1d(
-                        utr_soft.unsqueeze(0), kernel_size=window,
-                        stride=window // 2, padding=0,
-                    ).squeeze(0)  # (4, n_windows)
-                    # Penalize deviation in each window
-                    comp_loss = ((local_fracs - targets.unsqueeze(1)) ** 2).sum(dim=0).mean()
-                else:
-                    utr_nuc_fracs = utr_soft.mean(dim=1)
-                    comp_loss = ((utr_nuc_fracs - targets) ** 2).sum()
-            else:
-                utr_nuc_fracs = soft_seq.mean(dim=1)
-                comp_loss = ((utr_nuc_fracs - targets) ** 2).sum()
-
             # Overall composition for monitoring
             nuc_fracs = soft_seq.mean(dim=1)  # (4,) full sequence
 
+            # Scheduled handoff: start with recon_loss to guide toward z*,
+            # then ramp up obj_weight so actual predictions dominate.
+            # This prevents the recon_loss (MSE ~7-10) from drowning out
+            # obj_loss (specificity ~0.05-2) in early steps.
+            progress = step / max(self.n_steps - 1, 1)
+            recon_weight = 1.0 - 0.9 * progress  # 1.0 → 0.1
+            obj_ramp = self.obj_weight * (0.1 + 0.9 * progress)  # 10% → 100%
+
             # Total loss
-            loss = recon_loss + self.entropy_weight * ent_loss
+            loss = recon_weight * recon_loss + self.entropy_weight * ent_loss
             if self.use_obj:
-                loss = loss + self.obj_weight * obj_loss
-            if self.composition_weight > 0:
-                loss = loss + self.composition_weight * comp_loss
+                loss = loss + obj_ramp * obj_loss
             if self.l2_weight > 0 and utr_logits is not None:
                 loss = loss + self.l2_weight * (utr_logits ** 2).mean()
 
@@ -454,7 +422,10 @@ class GradientDecoder:
                 a_f, u_f, c_f, g_f = nuc_fracs.detach().cpu().tolist()
                 obj_str = ""
                 if self.use_obj:
-                    obj_str = f" | obj={-obj_loss.item():.4f}"
+                    obj_str = (
+                        f" | obj={-obj_loss.item():.4f}"
+                        f" (rw={recon_weight:.2f}, ow={obj_ramp:.2f})"
+                    )
                 print(
                     f"  [Inversion] Step {step:4d} | loss={loss.item():.6f} | "
                     f"recon={recon_loss.item():.6f}{obj_str} | "

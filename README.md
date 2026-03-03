@@ -209,21 +209,6 @@ After CEM finds the optimal latent vector z*, gradient inversion recovers the co
 | `--inversion-steps` | `500` | Number of gradient descent steps. Each step updates the soft sequence logits to match z*. **100-200**: Fast but higher latent distance (the decoded sequence's embedding won't closely match z*). Good for quick exploration. **500**: Standard. Usually sufficient for reasonable reconstruction. **1000+**: Lower latent distance but slow, especially for long sequences (13k nt). Diminishing returns after the loss plateaus. |
 | `--inversion-lr` | `0.05` | Learning rate for the Adam optimizer on sequence logits. **0.01**: Conservative, stable but slow convergence. **0.05** (default): Good balance. **0.1+**: Faster but may oscillate or diverge. If inversion loss is noisy, reduce this. |
 
-### Composition Constraints
-
-Without composition penalties, the gradient inversion produces **skewed nucleotide compositions** — the optimizer finds trivial solutions (e.g., poly-U or poly-A) that satisfy the latent objective but are biologically useless. These parameters enforce balanced composition:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--nuc-targets A U C G` | `0.25 0.25 0.25 0.25` | Target fraction for each nucleotide. The loss penalizes `sum((actual_i - target_i)²)` across all four nucleotides, preventing any single base from dominating. Example: `--nuc-targets 0.20 0.20 0.30 0.30` for GC-rich mRNAs. |
-| `--composition-weight` | `5.0` | Penalty strength for composition deviation. **0**: No composition constraint (produces degenerate sequences). **2.0**: Light guidance. **5.0** (default): Good balance — composition stays near targets while still allowing the optimizer room to match z*. **10.0+**: Very strict composition, may increase latent distance. |
-
-**Why this matters:**
-- **High U content** → TLR7/8 recognition → strong innate immune response (reactogenicity)
-- **Low GC content** → poor mRNA stability, faster degradation by RNases
-- **Extreme A-richness** → poly-A mimic → nonsense polyadenylation signals, ribosome stalling
-- Modern mRNA therapeutics (e.g., BNT162b2) use N1-methylpseudouridine; for pseudouridine designs, you can shift targets: `--nuc-targets 0.20 0.30 0.25 0.25`
-
 ### Synonymous Codon Constraints
 
 When you provide `--cds`, the CDS region is automatically constrained to **synonymous codon substitutions only**. This guarantees the encoded protein is preserved while allowing codon optimization for the target cell type. UTR regions are optimized freely. The output reports `Protein preserved: YES` to confirm.
