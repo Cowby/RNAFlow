@@ -149,6 +149,10 @@ class EnsembleRiboNNWrapper:
         return self.primary.max_seq_len
 
     @property
+    def input_channels(self) -> int:
+        return self.primary.input_channels
+
+    @property
     def label_codons(self) -> bool:
         return self.primary.label_codons
 
