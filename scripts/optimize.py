@@ -489,6 +489,7 @@ def main():
     print("Inverting best latent vector to mRNA sequence...")
     print("=" * 60 + "\n")
 
+    utr3_len = len(utr3_seq) if utr3_seq else 0
     decoder = GradientDecoder(
         wrapper=wrapper,
         seq_len=args.seq_len,
@@ -496,6 +497,7 @@ def main():
         lr=args.inversion_lr,
         utr5_size=utr5_size,
         cds_size=cds_size,
+        utr3_size=utr3_len,
         cds_seq=cds_seq if cds_seq else None,
         target_col=target_cell_idx,
         off_target_cols=off_target_idxs,
@@ -565,9 +567,7 @@ def main():
     opt_cds = seq[utr5_size:utr5_size + cds_len] if cds_len > 0 else ""
     opt_utr3_plus_pad = seq[utr5_size + cds_len:] if (utr5_size + cds_len) < len(seq) else ""
 
-    # Separate actual 3'UTR from padding (zeros)
-    # The input 3'UTR length gives us the intended region; rest is model padding
-    utr3_len = len(utr3_seq) if utr3_seq else 0
+    # utr3_len already defined above for GradientDecoder
 
     def _nuc_comp(s):
         """Return composition string for a region."""

@@ -107,7 +107,7 @@ def _codon_logits_to_soft_seq(
     masked_logits = codon_logits + (1 - codon_masks) * (-1e9)
 
     # Gumbel-softmax over synonymous codons
-    codon_probs = F.gumbel_softmax(masked_logits, tau=temperature, hard=False, dim=-1)
+    codon_probs = F.gumbel_softmax(masked_logits, tau=temperature, hard=True, dim=-1)
     # codon_probs: (n_codons, max_syn)
 
     # Weighted sum of codon one-hots: (n_codons, 4, 3)
@@ -143,6 +143,9 @@ class GradientDecoder:
         l2_weight: Optional L2 regularization on logits.
         utr5_size: Length of 5'UTR region.
         cds_size: Length of CDS including start+stop codons.
+        utr3_size: Length of 3'UTR region. Positions beyond utr5+cds+utr3 are
+            zero-padded (not optimized). If 0, all positions after CDS are
+            treated as optimizable UTR (legacy behavior).
         cds_seq: Actual CDS nucleotide sequence. When provided, CDS positions
             are constrained to synonymous codon substitutions only.
         target_col: Index of the target cell type in RiboNN output.
@@ -166,6 +169,7 @@ class GradientDecoder:
         l2_weight: float = 0.0,
         utr5_size: int = 0,
         cds_size: int = 0,
+        utr3_size: int = 0,
         cds_seq: str | None = None,
         target_col: int | None = None,
         off_target_cols: list[int] | None = None,
@@ -183,6 +187,7 @@ class GradientDecoder:
         self.l2_weight = l2_weight
         self.utr5_size = utr5_size
         self.cds_size = cds_size
+        self.utr3_size = utr3_size
         # Objective-aware inversion parameters
         self.target_col = target_col
         self.off_target_cols = off_target_cols or []
@@ -285,7 +290,13 @@ class GradientDecoder:
 
         cds_start = self.utr5_size
         cds_end = cds_start + self.cds_size
-        utr_tail_len = self.seq_len - cds_end  # positions after CDS (3'UTR + padding)
+        # Only optimize real UTR positions; remaining positions are zero-padded
+        if self.utr3_size > 0:
+            utr3_opt_len = self.utr3_size
+        else:
+            # Legacy: if utr3_size not specified, optimize all post-CDS positions
+            utr3_opt_len = self.seq_len - cds_end
+        pad_len = self.seq_len - (self.utr5_size + self.cds_size + utr3_opt_len)
 
         has_codon_constraint = (
             self._codon_onehots is not None and self.cds_size > 0
@@ -294,8 +305,8 @@ class GradientDecoder:
         # Initialize learnable parameters
         params = []
 
-        # UTR logits: all non-CDS positions (5'UTR + 3'UTR + padding)
-        utr_total = self.utr5_size + utr_tail_len
+        # UTR logits: only real UTR positions (5'UTR + 3'UTR), NOT padding
+        utr_total = self.utr5_size + utr3_opt_len
         if utr_total > 0:
             utr_logits = torch.randn(4, utr_total, device=self.device) * 0.1
             utr_logits = nn.Parameter(utr_logits)
@@ -332,7 +343,7 @@ class GradientDecoder:
             if self.utr5_size > 0 and utr_logits is not None:
                 utr5_soft = F.gumbel_softmax(
                     utr_logits[:, :self.utr5_size].T,
-                    tau=temp, hard=False, dim=-1
+                    tau=temp, hard=True, dim=-1
                 ).T  # (4, utr5_size)
                 parts.append(utr5_soft)
 
@@ -349,18 +360,23 @@ class GradientDecoder:
                 ).T
                 parts.append(cds_soft)
 
-            # 3'UTR + padding
-            if utr_tail_len > 0 and utr_logits is not None:
+            # 3'UTR (real positions only)
+            if utr3_opt_len > 0 and utr_logits is not None:
                 tail_soft = F.gumbel_softmax(
                     utr_logits[:, self.utr5_size:].T,
-                    tau=temp, hard=False, dim=-1
-                ).T  # (4, utr_tail_len)
+                    tau=temp, hard=True, dim=-1
+                ).T  # (4, utr3_opt_len)
                 parts.append(tail_soft)
 
             if parts:
-                soft_seq = torch.cat(parts, dim=1)  # (4, seq_len)
+                soft_seq = torch.cat(parts, dim=1)  # (4, bio_len)
             else:
                 soft_seq = torch.zeros(4, self.seq_len, device=self.device)
+
+            # Zero-pad to model's expected seq_len
+            if pad_len > 0 and len(parts) > 0:
+                padding = torch.zeros(4, pad_len, device=self.device)
+                soft_seq = torch.cat([soft_seq, padding], dim=1)
 
             # Apply mask if provided
             if mask is not None:
@@ -371,16 +387,13 @@ class GradientDecoder:
             if self._codon_channel is not None:
                 input_seq = torch.cat([soft_seq, self._codon_channel], dim=0)
 
-            # Encode through RiboNN (with gradients)
-            z = self.wrapper.encode_with_grad(input_seq.unsqueeze(0))
-            z = z.squeeze(0)
-
-            # Reconstruction loss
-            recon_loss = F.mse_loss(z, z_target)
-
-            # Objective-aware loss: run full forward pass to get TE predictions
-            # and optimize for cell-type specificity directly
+            # Objective-aware loss: full forward pass to get TE predictions
+            # and optimize for cell-type specificity directly.
+            # When obj is active, this is the primary optimization signal —
+            # codon logits are already initialized from the seed sequence,
+            # so we're directly improving on the wild-type baseline.
             obj_loss = torch.tensor(0.0, device=self.device)
+            target_te = torch.tensor(0.0)
             if self.use_obj:
                 te = self.wrapper.predict_with_grad(input_seq.unsqueeze(0))
                 te = te.squeeze(0)  # (num_targets,)
@@ -390,26 +403,33 @@ class GradientDecoder:
                 # Negate because we want to MAXIMIZE specificity
                 obj_loss = -specificity
 
+            # Reconstruction loss: latent distance to z_target.
+            # Only compute when needed (skip the extra CNN forward pass
+            # when obj dominates and recon_weight is negligible).
+            recon_loss = torch.tensor(0.0, device=self.device)
+            progress = step / max(self.n_steps - 1, 1)
+            recon_weight = max(1.0 - progress, 0.0)  # 1.0 → 0.0
+            if recon_weight > 0.01:
+                z = self.wrapper.encode_with_grad(input_seq.unsqueeze(0))
+                z = z.squeeze(0)
+                recon_loss = F.mse_loss(z, z_target)
+
             # Entropy regularizer on UTR logits only (CDS is codon-level)
             ent_loss = torch.tensor(0.0, device=self.device)
             if utr_logits is not None:
                 ent_loss = sequence_entropy(utr_logits)
 
-            # Overall composition for monitoring
-            nuc_fracs = soft_seq.mean(dim=1)  # (4,) full sequence
-
-            # Scheduled handoff: start with recon_loss to guide toward z*,
-            # then ramp up obj_weight so actual predictions dominate.
-            # This prevents the recon_loss (MSE ~7-10) from drowning out
-            # obj_loss (specificity ~0.05-2) in early steps.
-            progress = step / max(self.n_steps - 1, 1)
-            recon_weight = 1.0 - 0.9 * progress  # 1.0 → 0.1
-            obj_ramp = self.obj_weight * (0.1 + 0.9 * progress)  # 10% → 100%
+            # Composition over biological sequence only (exclude padding)
+            bio_len = self.utr5_size + self.cds_size + utr3_opt_len
+            if bio_len > 0:
+                nuc_fracs = soft_seq[:, :bio_len].mean(dim=1)
+            else:
+                nuc_fracs = soft_seq.mean(dim=1)
 
             # Total loss
             loss = recon_weight * recon_loss + self.entropy_weight * ent_loss
             if self.use_obj:
-                loss = loss + obj_ramp * obj_loss
+                loss = loss + self.obj_weight * obj_loss
             if self.l2_weight > 0 and utr_logits is not None:
                 loss = loss + self.l2_weight * (utr_logits ** 2).mean()
 
@@ -422,15 +442,14 @@ class GradientDecoder:
                 a_f, u_f, c_f, g_f = nuc_fracs.detach().cpu().tolist()
                 obj_str = ""
                 if self.use_obj:
-                    obj_str = (
-                        f" | obj={-obj_loss.item():.4f}"
-                        f" (rw={recon_weight:.2f}, ow={obj_ramp:.2f})"
-                    )
+                    te_val = target_te.item() if isinstance(target_te, torch.Tensor) else 0.0
+                    obj_str = f" | spec={-obj_loss.item():.4f} TE={te_val:.4f}"
+                recon_str = f" | recon={recon_loss.item():.4f}" if recon_weight > 0.01 else ""
                 print(
-                    f"  [Inversion] Step {step:4d} | loss={loss.item():.6f} | "
-                    f"recon={recon_loss.item():.6f}{obj_str} | "
+                    f"  [Inversion] Step {step:4d} | loss={loss.item():.6f}"
+                    f"{recon_str}{obj_str} | "
                     f"A={a_f:.1%} U={u_f:.1%} C={c_f:.1%} G={g_f:.1%} | "
-                    f"temp={temp:.3f}"
+                    f"temp={temp:.3f} rw={recon_weight:.2f}"
                 )
 
         # Final discrete sequence
@@ -458,8 +477,8 @@ class GradientDecoder:
                 cds_hard = F.one_hot(cds_nuc_logits.detach().argmax(dim=0), 4).T.float()
                 final_parts.append(cds_hard)
 
-            # 3'UTR + padding
-            if utr_tail_len > 0 and utr_logits is not None:
+            # 3'UTR (real positions only)
+            if utr3_opt_len > 0 and utr_logits is not None:
                 tail_logits_final = utr_logits[:, self.utr5_size:].detach()
                 tail_hard = F.one_hot(tail_logits_final.argmax(dim=0), 4).T.float()
                 final_parts.append(tail_hard)
@@ -469,13 +488,19 @@ class GradientDecoder:
             else:
                 hard_seq = torch.zeros(4, self.seq_len, device=self.device)
 
+            # Zero-pad to model's expected seq_len
+            if pad_len > 0 and len(final_parts) > 0:
+                padding = torch.zeros(4, pad_len, device=self.device)
+                hard_seq = torch.cat([hard_seq, padding], dim=1)
+
             if mask is not None:
                 hard_seq = hard_seq * mask.float().unsqueeze(0).to(self.device)
 
-            # Decode to string
-            sequence = decode_logits(hard_seq)
+            # Decode to string — only the biological positions
+            bio_len = self.utr5_size + self.cds_size + utr3_opt_len
+            sequence = decode_logits(hard_seq[:, :bio_len] if bio_len > 0 else hard_seq)
 
-            # Compute final latent distance
+            # Compute final latent distance (uses full padded tensor for model)
             encode_input = hard_seq
             if self._codon_channel is not None:
                 encode_input = torch.cat([hard_seq, self._codon_channel], dim=0)
@@ -484,7 +509,7 @@ class GradientDecoder:
 
         # Trim padded positions if mask is provided
         if mask is not None:
-            active_len = mask.sum().item()
+            active_len = int(mask.sum().item())
             sequence = sequence[:active_len]
 
         return InversionResult(
