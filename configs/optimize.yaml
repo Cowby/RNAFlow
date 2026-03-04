@@ -15,7 +15,7 @@ off_target_cells: [HEK293T, K562, A549, MCF7]  # cell types to minimize TE for
 lam: 1.0                        # off-target penalty weight
 
 # Optimizer
-optimizer: flow                  # 'flow', 'vanilla', or 'diffusion'
+optimizer: flow                  # 'flow', 'vanilla', 'diffusion', or 'direct'
 pop_size: 512                    # candidates per CEM iteration / diffusion batch
 elite_frac: 0.05                # fraction of top samples to keep (CEM only)
 n_iters: 200                    # number of CEM iterations / diffusion steps

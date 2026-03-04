@@ -53,11 +53,12 @@ from rnaflow.data.cell_types import (
 from rnaflow.data.encoding import one_hot_encode_ribonn
 from rnaflow.embeddings.ribonn_wrapper import RiboNNWrapper, MockRiboNN
 from rnaflow.embeddings.ensemble import EnsembleRiboNNWrapper
-from rnaflow.inversion.gradient_decoder import GradientDecoder
+from rnaflow.inversion.gradient_decoder import GradientDecoder, InversionResult
 from rnaflow.models.predictor import TranslationPredictor
 from rnaflow.optim.flow_cem import FlowCEM
 from rnaflow.optim.cem import VanillaCEM
 from rnaflow.optim.diffusion import DiffusionOptimizer
+from rnaflow.optim.direct import DirectOptimizer
 from rnaflow.optim.objective import PredictorSpecificityObjective, LatentRiboNNObjective
 from rnaflow.data.codon_table import translate
 from rnaflow.utils.config import load_config
@@ -189,8 +190,9 @@ def main():
 
     # ── CEM optimizer ─────────────────────────────────────────────────────
     cem_group = parser.add_argument_group("CEM optimizer")
-    cem_group.add_argument("--optimizer", choices=["flow", "vanilla", "diffusion"], default="flow",
-                           help="'flow' = FlowCEM; 'vanilla' = standard CEM; 'diffusion' = DDPM with guidance")
+    cem_group.add_argument("--optimizer", choices=["flow", "vanilla", "diffusion", "direct"], default="flow",
+                           help="'flow' = FlowCEM; 'vanilla' = standard CEM; 'diffusion' = DDPM with guidance; "
+                                "'direct' = gradient descent on codons through full CNN (no latent stage)")
     cem_group.add_argument("--pop-size", type=int, default=512,
                            help="Candidates per iteration. Larger = better exploration, slower")
     cem_group.add_argument("--elite-frac", type=float, default=0.05,
@@ -420,100 +422,145 @@ def main():
             lam=args.lam,
         )
 
-    # ── Initialize CEM ───────────────────────────────────────────────────
-    init_mu = None
-    if seed_sequence:
-        print(f"\nEncoding seed sequence as CEM starting point...")
-        init_mu = wrapper.encode_sequence(
-            seed_sequence,
-            max_len=args.seq_len,
+    # ── Run optimization ─────────────────────────────────────────────────
+    utr3_len = len(utr3_seq) if utr3_seq else 0
+
+    if args.optimizer == "direct":
+        # Direct codon optimization: skip latent stage entirely
+        print(f"\nOptimizer: DIRECT | steps={args.inversion_steps} | "
+              f"lr={args.inversion_lr}")
+
+        print("\n" + "=" * 60)
+        print("Starting direct codon optimization...")
+        print("=" * 60 + "\n")
+
+        direct_opt = DirectOptimizer(
+            wrapper=wrapper,
+            seq_len=args.seq_len,
             utr5_size=utr5_size,
             cds_size=cds_size,
+            utr3_size=utr3_len,
+            cds_seq=cds_seq if cds_seq else None,
+            target_col=target_cell_idx,
+            off_target_cols=off_target_idxs,
+            lam=args.lam,
+            n_steps=args.inversion_steps,
+            lr=args.inversion_lr,
+            device=args.device,
         )
-        print(f"  Seed embedding norm: {init_mu.norm():.4f}")
+        direct_result = direct_opt.optimize(verbose=True)
 
-    if args.optimizer == "diffusion":
-        diff_steps = args.diffusion_steps or args.n_iters
-        print(f"\nOptimizer: DIFFUSION | batch={args.pop_size} | "
-              f"steps={diff_steps} | guidance={args.guidance_scale}")
+        # Wrap into InversionResult for the rest of the pipeline
+        inv_result = InversionResult(
+            sequence=direct_result.sequence,
+            logits=direct_result.logits,
+            final_loss=-direct_result.best_score,
+            latent_distance=0.0,
+            loss_history=[],
+        )
+        # Create a compatible result object for score reporting
+        class _ResultCompat:
+            def __init__(self, dr):
+                self.best_score = dr.best_score
+                self.best_z = dr.best_z
+                self.history = dr.history
+        result = _ResultCompat(direct_result)
+
+        print(f"\nBest specificity: {direct_result.best_score:.4f}")
+
     else:
-        print(f"\nOptimizer: {args.optimizer.upper()} CEM | "
-              f"pop={args.pop_size} | elite={args.elite_frac} | iters={args.n_iters}")
+        # Latent space optimization (flow/vanilla/diffusion)
+        init_mu = None
+        if seed_sequence:
+            print(f"\nEncoding seed sequence as CEM starting point...")
+            init_mu = wrapper.encode_sequence(
+                seed_sequence,
+                max_len=args.seq_len,
+                utr5_size=utr5_size,
+                cds_size=cds_size,
+            )
+            print(f"  Seed embedding norm: {init_mu.norm():.4f}")
 
-    if args.optimizer == "flow":
-        optimizer = FlowCEM(
-            dim=latent_dim,
-            pop_size=args.pop_size,
-            elite_frac=args.elite_frac,
-            n_iters=args.n_iters,
-            init_mu=init_mu,
-            schedule=args.schedule,
-            momentum=args.momentum,
+        if args.optimizer == "diffusion":
+            diff_steps = args.diffusion_steps or args.n_iters
+            print(f"\nOptimizer: DIFFUSION | batch={args.pop_size} | "
+                  f"steps={diff_steps} | guidance={args.guidance_scale}")
+        else:
+            print(f"\nOptimizer: {args.optimizer.upper()} CEM | "
+                  f"pop={args.pop_size} | elite={args.elite_frac} | iters={args.n_iters}")
+
+        if args.optimizer == "flow":
+            optimizer = FlowCEM(
+                dim=latent_dim,
+                pop_size=args.pop_size,
+                elite_frac=args.elite_frac,
+                n_iters=args.n_iters,
+                init_mu=init_mu,
+                schedule=args.schedule,
+                momentum=args.momentum,
+                device=args.device,
+            )
+        elif args.optimizer == "diffusion":
+            optimizer = DiffusionOptimizer(
+                dim=latent_dim,
+                batch_size=args.pop_size,
+                n_steps=args.diffusion_steps or args.n_iters,
+                guidance_scale=args.guidance_scale,
+                noise_schedule=args.noise_schedule,
+                init_mu=init_mu,
+                n_repeats=args.n_repeats,
+                clip_grad_norm=args.clip_grad_norm,
+                proximity_weight=args.proximity_weight,
+                max_radius=args.max_radius,
+                device=args.device,
+            )
+        else:
+            optimizer = VanillaCEM(
+                dim=latent_dim,
+                pop_size=args.pop_size,
+                elite_frac=args.elite_frac,
+                n_iters=args.n_iters,
+                init_mu=init_mu,
+                device=args.device,
+            )
+
+        print("\n" + "=" * 60)
+        print("Starting optimization...")
+        print("=" * 60 + "\n")
+
+        result = optimizer.optimize(objective, verbose=True)
+
+        print(f"\nBest objective score: {result.best_score:.4f}")
+
+        # ── Gradient-based inversion ─────────────────────────────────────
+        print("\n" + "=" * 60)
+        print("Inverting best latent vector to mRNA sequence...")
+        print("=" * 60 + "\n")
+
+        decoder = GradientDecoder(
+            wrapper=wrapper,
+            seq_len=args.seq_len,
+            n_steps=args.inversion_steps,
+            lr=args.inversion_lr,
+            utr5_size=utr5_size,
+            cds_size=cds_size,
+            utr3_size=utr3_len,
+            cds_seq=cds_seq if cds_seq else None,
+            target_col=target_cell_idx,
+            off_target_cols=off_target_idxs,
+            obj_weight=args.obj_weight,
+            lam=args.lam,
             device=args.device,
         )
-    elif args.optimizer == "diffusion":
-        optimizer = DiffusionOptimizer(
-            dim=latent_dim,
-            batch_size=args.pop_size,
-            n_steps=args.diffusion_steps or args.n_iters,
-            guidance_scale=args.guidance_scale,
-            noise_schedule=args.noise_schedule,
-            init_mu=init_mu,
-            n_repeats=args.n_repeats,
-            clip_grad_norm=args.clip_grad_norm,
-            proximity_weight=args.proximity_weight,
-            max_radius=args.max_radius,
-            device=args.device,
-        )
-    else:
-        optimizer = VanillaCEM(
-            dim=latent_dim,
-            pop_size=args.pop_size,
-            elite_frac=args.elite_frac,
-            n_iters=args.n_iters,
-            init_mu=init_mu,
-            device=args.device,
-        )
 
-    # ── Run optimization ─────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Starting optimization...")
-    print("=" * 60 + "\n")
-
-    result = optimizer.optimize(objective, verbose=True)
-
-    print(f"\nBest objective score: {result.best_score:.4f}")
-
-    # ── Gradient-based inversion ─────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Inverting best latent vector to mRNA sequence...")
-    print("=" * 60 + "\n")
-
-    utr3_len = len(utr3_seq) if utr3_seq else 0
-    decoder = GradientDecoder(
-        wrapper=wrapper,
-        seq_len=args.seq_len,
-        n_steps=args.inversion_steps,
-        lr=args.inversion_lr,
-        utr5_size=utr5_size,
-        cds_size=cds_size,
-        utr3_size=utr3_len,
-        cds_seq=cds_seq if cds_seq else None,
-        target_col=target_cell_idx,
-        off_target_cols=off_target_idxs,
-        obj_weight=args.obj_weight,
-        lam=args.lam,
-        device=args.device,
-    )
-
-    inv_result = decoder.invert(result.best_z, verbose=True)
+        inv_result = decoder.invert(result.best_z, verbose=True)
 
     # ── Results ──────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
     print(f"Sequence length: {len(inv_result.sequence)}")
-    print(f"Latent distance (z* vs encoded sequence): {inv_result.latent_distance:.4f}")
+    print(f"Latent distance: {inv_result.latent_distance:.4f}")
     print(f"Objective score: {result.best_score:.4f}")
 
     seq = inv_result.sequence
