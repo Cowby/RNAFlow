@@ -27,6 +27,15 @@ from rnaflow.optim.objective import _compute_specificity
 
 
 @dataclass
+class DirectCandidate:
+    """A single candidate from direct optimization."""
+    sequence: str
+    score: float
+    z: Tensor
+    logits: Tensor | None = None
+
+
+@dataclass
 class DirectResult:
     """Result of direct codon optimization."""
     best_z: Tensor
@@ -34,6 +43,7 @@ class DirectResult:
     history: list[float] = field(default_factory=list)
     sequence: str = ""
     logits: Tensor | None = None
+    candidates: list[DirectCandidate] = field(default_factory=list)
 
 
 class DirectOptimizer:
@@ -57,6 +67,7 @@ class DirectOptimizer:
         obj_mode: "linear" or "ratio" specificity formula.
         n_steps: Optimization steps.
         n_repeats: Independent optimization runs (keep best).
+        top_k: Number of top candidates to keep across repeats.
         lr: Learning rate for Adam.
         temp_start: Initial Gumbel-softmax temperature.
         temp_end: Final Gumbel-softmax temperature.
@@ -80,6 +91,7 @@ class DirectOptimizer:
         obj_mode: str = "linear",
         n_steps: int = 500,
         n_repeats: int = 1,
+        top_k: int = 1,
         lr: float = 0.05,
         temp_start: float = 2.0,
         temp_end: float = 0.1,
@@ -97,6 +109,7 @@ class DirectOptimizer:
         self.obj_mode = obj_mode
         self.n_steps = n_steps
         self.n_repeats = n_repeats
+        self.top_k = top_k
         self.lr = lr
         self.temp_start = temp_start
         self.temp_end = temp_end
@@ -378,23 +391,51 @@ class DirectOptimizer:
 
         If n_repeats > 1, runs multiple independent optimization passes
         (each with fresh random Gumbel noise) and returns the best result.
+        When top_k > 1, collects the top-K candidates across all repeats.
 
         Returns:
-            DirectResult with optimized sequence and trajectory.
+            DirectResult with optimized sequence, trajectory, and top-K candidates.
         """
         if self.n_repeats <= 1:
-            return self._optimize_once(verbose=verbose)
+            result = self._optimize_once(verbose=verbose)
+            if self.top_k > 1:
+                result.candidates = [DirectCandidate(
+                    sequence=result.sequence,
+                    score=result.best_score,
+                    z=result.best_z,
+                    logits=result.logits,
+                )]
+            return result
 
+        # Collect all repeat results as candidates
+        all_candidates: list[DirectCandidate] = []
         best_result: DirectResult | None = None
+
         for rep in range(self.n_repeats):
             if verbose:
                 print(f"\n--- Direct repeat {rep + 1}/{self.n_repeats} ---")
             result = self._optimize_once(verbose=verbose)
+
+            all_candidates.append(DirectCandidate(
+                sequence=result.sequence,
+                score=result.best_score,
+                z=result.best_z,
+                logits=result.logits,
+            ))
+
             if best_result is None or result.best_score > best_result.best_score:
                 best_result = result
                 if verbose:
                     print(f"  New best: {result.best_score:.4f}")
 
+        # Sort by score descending and keep top-K
+        all_candidates.sort(key=lambda c: c.score, reverse=True)
+        keep_k = min(self.top_k, len(all_candidates))
+        best_result.candidates = all_candidates[:keep_k]
+
         if verbose:
             print(f"\nBest across {self.n_repeats} repeats: {best_result.best_score:.4f}")
+            if keep_k > 1:
+                print(f"Kept top {keep_k} candidates (scores: "
+                      f"{', '.join(f'{c.score:.4f}' for c in best_result.candidates)})")
         return best_result

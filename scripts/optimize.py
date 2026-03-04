@@ -221,7 +221,11 @@ def main():
     diff_group.add_argument("--clip-grad-norm", type=float, default=1.0,
                             help="Gradient clipping norm for diffusion guidance")
     diff_group.add_argument("--n-repeats", type=int, default=1,
-                            help="Number of independent diffusion runs (keep best)")
+                            help="Number of independent optimization runs (keep best). "
+                                 "Used by diffusion and direct optimizers")
+    diff_group.add_argument("--top-k", type=int, default=1,
+                            help="Keep top K candidates across repeats (requires --n-repeats >= K). "
+                                 "Candidates saved to optimized_candidates.fasta")
     diff_group.add_argument("--proximity-weight", type=float, default=0.1,
                             help="Penalty for ||z - seed||²/dim during guidance. "
                                  "Prevents drift into unrealistic latent regions. 0 = disabled")
@@ -457,6 +461,7 @@ def main():
             obj_mode=obj_mode,
             n_steps=args.inversion_steps,
             n_repeats=args.n_repeats,
+            top_k=args.top_k,
             lr=args.inversion_lr,
             device=args.device,
         )
@@ -476,6 +481,7 @@ def main():
                 self.best_score = dr.best_score
                 self.best_z = dr.best_z
                 self.history = dr.history
+                self.candidates = dr.candidates
         result = _ResultCompat(direct_result)
 
         print(f"\nBest specificity: {direct_result.best_score:.4f}")
@@ -602,6 +608,7 @@ def main():
                 obj_mode=obj_mode,
                 n_steps=args.inversion_steps,
                 n_repeats=args.n_repeats,
+                top_k=args.top_k,
                 lr=args.inversion_lr,
                 device=args.device,
             )
@@ -622,6 +629,7 @@ def main():
                     self.best_score = dr.best_score
                     self.best_z = dr.best_z
                     self.history = latent_result.history + dr.history
+                    self.candidates = dr.candidates
             result = _CombinedResultCompat(result, direct_result)
 
             print(f"\nCombined best specificity: {direct_result.best_score:.4f}")
@@ -841,6 +849,37 @@ def main():
             _write_fasta_entry(f, f"3UTR len={utr3_len}", opt_utr3_plus_pad[:utr3_len])
     print(f"Saved regions to {regions_path}")
 
+    # Save top-K candidates (if available)
+    candidates = getattr(result, "candidates", [])
+    if len(candidates) > 1:
+        cands_path = output_dir / "optimized_candidates.fasta"
+        with open(cands_path, "w") as f:
+            for rank, cand in enumerate(candidates, 1):
+                cand_bio = cand.sequence[:bio_len] if bio_len > 0 else cand.sequence
+                _write_fasta_entry(
+                    f,
+                    f"candidate_{rank} target={target_name} score={cand.score:.4f} "
+                    f"len={len(cand_bio)}",
+                    cand_bio,
+                )
+        print(f"Saved {len(candidates)} candidates to {cands_path}")
+
+        # Print candidate summary table
+        print(f"\n--- Top {len(candidates)} Candidates ---")
+        print(f"  {'Rank':<6} {'Score':>10}  Predictions")
+        print(f"  {'-'*6} {'-'*10}  {'-'*40}")
+        for rank, cand in enumerate(candidates, 1):
+            cand_te = wrapper.predict_sequence(
+                cand.sequence, max_len=args.seq_len,
+                utr5_size=utr5_size, cds_size=cds_len,
+            )
+            te_str = "  ".join(
+                f"{ct_name}={cand_te[ct_idx].item():.4f}"
+                for ct_idx, ct_name in zip(all_cell_idxs, all_cell_names)
+            )
+            marker = " *" if rank == 1 else ""
+            print(f"  {rank:<6} {cand.score:>10.4f}  {te_str}{marker}")
+
     # Save optimization results
     results_dict = {
         "best_score": result.best_score,
@@ -875,14 +914,39 @@ def main():
             for ct_idx, ct_name in zip(all_cell_idxs, all_cell_names)
         }
         results_dict["predictions"]["original_specificity"] = orig_specificity
+
+    # Add candidates to results
+    if len(candidates) > 1:
+        cand_list = []
+        for rank, cand in enumerate(candidates, 1):
+            cand_bio = cand.sequence[:bio_len] if bio_len > 0 else cand.sequence
+            cand_te = wrapper.predict_sequence(
+                cand.sequence, max_len=args.seq_len,
+                utr5_size=utr5_size, cds_size=cds_len,
+            )
+            cand_list.append({
+                "rank": rank,
+                "score": cand.score,
+                "sequence": cand_bio,
+                "predictions": {
+                    ct_name: cand_te[ct_idx].item()
+                    for ct_idx, ct_name in zip(all_cell_idxs, all_cell_names)
+                },
+            })
+        results_dict["candidates"] = cand_list
+
     with open(output_dir / "results.json", "w") as f:
         json.dump(results_dict, f, indent=2)
 
-    # Save latent vector
-    torch.save({
+    # Save latent vector(s)
+    save_dict = {
         "best_z": result.best_z.cpu(),
         "history": result.history,
-    }, output_dir / "optimization.pt")
+    }
+    if len(candidates) > 1:
+        save_dict["top_k_z"] = [c.z.cpu() for c in candidates]
+        save_dict["top_k_scores"] = [c.score for c in candidates]
+    torch.save(save_dict, output_dir / "optimization.pt")
 
     # Plot
     plot_optimization(result, str(output_dir / "optimization_plot.png"))

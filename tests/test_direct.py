@@ -244,3 +244,60 @@ def test_direct_n_repeats():
     # History should be from the best single run (10 steps, not 30)
     assert len(result.history) == 10
     assert len(result.sequence) == 30  # 6 + 18 + 6
+
+
+def test_direct_top_k_candidates():
+    """top_k collects multiple candidates sorted by score."""
+    from rnaflow.optim.direct import DirectCandidate
+
+    opt = DirectOptimizer(
+        wrapper=_MockWrapper(),
+        seq_len=100,
+        utr5_size=6,
+        cds_size=18,
+        utr3_size=6,
+        cds_seq="AUGGCUAGCUAGCUAUAG",
+        utr5_seq="ACGUAC",
+        utr3_seq="GUACGU",
+        target_col=0,
+        off_target_cols=[1, 2],
+        n_steps=10,
+        n_repeats=5,
+        top_k=3,
+    )
+    result = opt.optimize(verbose=False)
+
+    assert isinstance(result, DirectResult)
+    assert len(result.candidates) == 3
+    # Candidates should be sorted by score descending
+    for i in range(len(result.candidates) - 1):
+        assert result.candidates[i].score >= result.candidates[i + 1].score
+    # Best candidate should match the overall best
+    assert result.candidates[0].score == result.best_score
+    assert result.candidates[0].sequence == result.sequence
+    # Each candidate should be a DirectCandidate
+    for cand in result.candidates:
+        assert isinstance(cand, DirectCandidate)
+        assert len(cand.sequence) == 30
+
+
+def test_direct_top_k_single_repeat():
+    """top_k with n_repeats=1 returns 1 candidate."""
+    opt = DirectOptimizer(
+        wrapper=_MockWrapper(),
+        seq_len=100,
+        utr5_size=6,
+        cds_size=18,
+        utr3_size=6,
+        cds_seq="AUGGCUAGCUAGCUAUAG",
+        target_col=0,
+        off_target_cols=[1, 2],
+        n_steps=10,
+        n_repeats=1,
+        top_k=5,
+    )
+    result = opt.optimize(verbose=False)
+
+    # Can only get 1 candidate from 1 repeat
+    assert len(result.candidates) == 1
+    assert result.candidates[0].score == result.best_score
