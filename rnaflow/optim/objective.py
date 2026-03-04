@@ -12,6 +12,24 @@ from torch import Tensor
 import torch.nn as nn
 
 
+def _compute_specificity(
+    target_eff: Tensor, off_target_eff: Tensor, lam: float, obj_mode: str,
+) -> Tensor:
+    """Compute specificity score using the selected mode.
+
+    Args:
+        target_eff: Target cell type TE values.
+        off_target_eff: Mean off-target TE values.
+        lam: Off-target penalty weight.
+        obj_mode: "linear" for TE_t - lam*TE_off,
+                  "ratio" for log(TE_t) - lam*log(TE_off).
+    """
+    if obj_mode == "ratio":
+        return (torch.log(target_eff.clamp(min=1e-6))
+                - lam * torch.log(off_target_eff.clamp(min=1e-6)))
+    return target_eff - lam * off_target_eff
+
+
 class RiboNNSpecificityObjective:
     """Specificity objective using RiboNN's multi-target TE predictions directly.
 
@@ -26,6 +44,7 @@ class RiboNNSpecificityObjective:
         target_col: Index of the target cell type in RiboNN's output.
         off_target_cols: Indices of off-target cell types.
         lam: Weight for the off-target penalty.
+        obj_mode: "linear" or "ratio".
     """
 
     def __init__(
@@ -34,11 +53,13 @@ class RiboNNSpecificityObjective:
         target_col: int,
         off_target_cols: list[int],
         lam: float = 1.0,
+        obj_mode: str = "linear",
     ):
         self.wrapper = wrapper
         self.target_col = target_col
         self.off_target_cols = off_target_cols
         self.lam = lam
+        self.obj_mode = obj_mode
 
     @torch.no_grad()
     def __call__(self, x: Tensor) -> Tensor:
@@ -52,10 +73,8 @@ class RiboNNSpecificityObjective:
         """
         te = self.wrapper.predict(x)  # (N, num_targets)
         target_eff = te[:, self.target_col]
-
         off_target_eff = te[:, self.off_target_cols].mean(dim=1)
-
-        return target_eff - self.lam * off_target_eff
+        return _compute_specificity(target_eff, off_target_eff, self.lam, self.obj_mode)
 
 
 class LatentRiboNNObjective:
@@ -74,6 +93,7 @@ class LatentRiboNNObjective:
         target_col: Index of the target cell type in RiboNN's output.
         off_target_cols: Indices of off-target cell types.
         lam: Weight for the off-target penalty.
+        obj_mode: "linear" or "ratio".
     """
 
     def __init__(
@@ -82,11 +102,13 @@ class LatentRiboNNObjective:
         target_col: int,
         off_target_cols: list[int],
         lam: float = 1.0,
+        obj_mode: str = "linear",
     ):
         self.wrapper = wrapper
         self.target_col = target_col
         self.off_target_cols = off_target_cols
         self.lam = lam
+        self.obj_mode = obj_mode
 
         # Extract the tail of the head (layers 5-7: BN -> Dropout -> Linear)
         # For ensembles, use pre-extracted head_tails from all models
@@ -122,8 +144,7 @@ class LatentRiboNNObjective:
 
         target_eff = te[:, self.target_col]
         off_target_eff = te[:, self.off_target_cols].mean(dim=1)
-
-        return target_eff - self.lam * off_target_eff
+        return _compute_specificity(target_eff, off_target_eff, self.lam, self.obj_mode)
 
 
 class PredictorSpecificityObjective:
@@ -137,6 +158,7 @@ class PredictorSpecificityObjective:
         off_target_cells: List of off-target cell type IDs.
         lam: Weight for the off-target penalty.
         device: Torch device.
+        obj_mode: "linear" or "ratio".
     """
 
     def __init__(
@@ -146,6 +168,7 @@ class PredictorSpecificityObjective:
         off_target_cells: list[int],
         lam: float = 1.0,
         device: str = "cpu",
+        obj_mode: str = "linear",
     ):
         self.predictor = predictor
         self.predictor.eval()
@@ -153,6 +176,7 @@ class PredictorSpecificityObjective:
         self.off_target_cells = off_target_cells
         self.lam = lam
         self.device = torch.device(device)
+        self.obj_mode = obj_mode
 
     @torch.no_grad()
     def __call__(self, z: Tensor) -> Tensor:
@@ -178,7 +202,7 @@ class PredictorSpecificityObjective:
             )
         off_target_eff /= len(self.off_target_cells)
 
-        return target_eff - self.lam * off_target_eff
+        return _compute_specificity(target_eff, off_target_eff, self.lam, self.obj_mode)
 
 
 class CombinedObjective:

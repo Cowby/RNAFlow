@@ -23,6 +23,7 @@ from rnaflow.inversion.gradient_decoder import (
     _build_synonymous_tables,
     _codon_logits_to_soft_seq,
 )
+from rnaflow.optim.objective import _compute_specificity
 
 
 @dataclass
@@ -48,10 +49,14 @@ class DirectOptimizer:
         cds_size: Length of CDS region.
         utr3_size: Length of 3'UTR region.
         cds_seq: Original CDS nucleotide sequence (for synonymous constraints).
+        utr5_seq: Original 5'UTR nucleotide sequence (for seed initialization).
+        utr3_seq: Original 3'UTR nucleotide sequence (for seed initialization).
         target_col: Index of target cell type in RiboNN output.
         off_target_cols: Indices of off-target cell types.
         lam: Off-target penalty weight.
+        obj_mode: "linear" or "ratio" specificity formula.
         n_steps: Optimization steps.
+        n_repeats: Independent optimization runs (keep best).
         lr: Learning rate for Adam.
         temp_start: Initial Gumbel-softmax temperature.
         temp_end: Final Gumbel-softmax temperature.
@@ -67,10 +72,14 @@ class DirectOptimizer:
         cds_size: int = 0,
         utr3_size: int = 0,
         cds_seq: str | None = None,
+        utr5_seq: str | None = None,
+        utr3_seq: str | None = None,
         target_col: int = 0,
         off_target_cols: list[int] | None = None,
         lam: float = 1.0,
+        obj_mode: str = "linear",
         n_steps: int = 500,
+        n_repeats: int = 1,
         lr: float = 0.05,
         temp_start: float = 2.0,
         temp_end: float = 0.1,
@@ -85,12 +94,18 @@ class DirectOptimizer:
         self.target_col = target_col
         self.off_target_cols = off_target_cols or []
         self.lam = lam
+        self.obj_mode = obj_mode
         self.n_steps = n_steps
+        self.n_repeats = n_repeats
         self.lr = lr
         self.temp_start = temp_start
         self.temp_end = temp_end
         self.entropy_weight = entropy_weight
         self.device = torch.device(device)
+
+        # UTR seed sequences (for biased initialization)
+        self.utr5_seq = utr5_seq.upper().replace("T", "U") if utr5_seq else None
+        self.utr3_seq = utr3_seq.upper().replace("T", "U") if utr3_seq else None
 
         # CDS codon constraint tables
         self.cds_seq = cds_seq.upper().replace("T", "U") if cds_seq else None
@@ -149,8 +164,41 @@ class DirectOptimizer:
                     break
         return logits
 
-    def optimize(self, verbose: bool = True) -> DirectResult:
-        """Run direct codon optimization.
+    def _init_utr_logits(self) -> Tensor:
+        """Initialize UTR logits biased toward the seed UTR nucleotides.
+
+        If seed UTR sequences are provided, the logit for the original
+        nucleotide at each position is set to 3.0 (same bias as CDS codons).
+        Otherwise falls back to small random initialization.
+        """
+        utr_total = self.utr5_size + self.utr3_size
+        logits = torch.randn(4, utr_total, device=self.device) * 0.1
+
+        # Bias 5'UTR positions toward seed nucleotides
+        if self.utr5_seq and self.utr5_size > 0:
+            seed_len = min(len(self.utr5_seq), self.utr5_size)
+            for pos in range(seed_len):
+                nuc = self.utr5_seq[pos]
+                idx = NUC_IDX.get(nuc)
+                if idx is not None:
+                    logits[:, pos] = 0.0
+                    logits[idx, pos] = 3.0
+
+        # Bias 3'UTR positions toward seed nucleotides
+        if self.utr3_seq and self.utr3_size > 0:
+            seed_len = min(len(self.utr3_seq), self.utr3_size)
+            offset = self.utr5_size
+            for pos in range(seed_len):
+                nuc = self.utr3_seq[pos]
+                idx = NUC_IDX.get(nuc)
+                if idx is not None:
+                    logits[:, offset + pos] = 0.0
+                    logits[idx, offset + pos] = 3.0
+
+        return logits
+
+    def _optimize_once(self, verbose: bool = True) -> DirectResult:
+        """Run a single optimization pass.
 
         Returns:
             DirectResult with optimized sequence and trajectory.
@@ -163,11 +211,10 @@ class DirectOptimizer:
         # Initialize learnable parameters
         params = []
 
-        # UTR logits (5'UTR + 3'UTR only)
+        # UTR logits (5'UTR + 3'UTR only) — biased toward seed UTRs
         utr_total = self.utr5_size + utr3_opt_len
         if utr_total > 0:
-            utr_logits = torch.randn(4, utr_total, device=self.device) * 0.1
-            utr_logits = nn.Parameter(utr_logits)
+            utr_logits = nn.Parameter(self._init_utr_logits())
             params.append(utr_logits)
         else:
             utr_logits = None
@@ -232,7 +279,10 @@ class DirectOptimizer:
             te = te.squeeze(0)
             target_te = te[self.target_col]
             off_target_te = te[self.off_target_cols].mean()
-            specificity = target_te - self.lam * off_target_te
+            specificity = _compute_specificity(
+                target_te.unsqueeze(0), off_target_te.unsqueeze(0),
+                self.lam, self.obj_mode,
+            ).squeeze(0)
 
             # Loss = maximize specificity + entropy regularizer
             loss = -specificity
@@ -322,3 +372,29 @@ class DirectOptimizer:
             sequence=sequence,
             logits=hard_seq.cpu(),
         )
+
+    def optimize(self, verbose: bool = True) -> DirectResult:
+        """Run direct codon optimization with optional repeats.
+
+        If n_repeats > 1, runs multiple independent optimization passes
+        (each with fresh random Gumbel noise) and returns the best result.
+
+        Returns:
+            DirectResult with optimized sequence and trajectory.
+        """
+        if self.n_repeats <= 1:
+            return self._optimize_once(verbose=verbose)
+
+        best_result: DirectResult | None = None
+        for rep in range(self.n_repeats):
+            if verbose:
+                print(f"\n--- Direct repeat {rep + 1}/{self.n_repeats} ---")
+            result = self._optimize_once(verbose=verbose)
+            if best_result is None or result.best_score > best_result.best_score:
+                best_result = result
+                if verbose:
+                    print(f"  New best: {result.best_score:.4f}")
+
+        if verbose:
+            print(f"\nBest across {self.n_repeats} repeats: {best_result.best_score:.4f}")
+        return best_result

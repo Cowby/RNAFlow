@@ -187,12 +187,17 @@ def main():
                            help="Off-target cell types (names or indices)")
     obj_group.add_argument("--lam", type=float, default=1.0,
                            help="Off-target penalty weight. Higher = stronger off-target suppression")
+    obj_group.add_argument("--obj-mode", choices=["linear", "ratio"], default="linear",
+                           help="Specificity formula: 'linear' = TE_t - lam*TE_off; "
+                                "'ratio' = log(TE_t) - lam*log(TE_off) (forces true ratio improvement)")
 
     # ── CEM optimizer ─────────────────────────────────────────────────────
     cem_group = parser.add_argument_group("CEM optimizer")
-    cem_group.add_argument("--optimizer", choices=["flow", "vanilla", "diffusion", "direct"], default="flow",
+    cem_group.add_argument("--optimizer", choices=["flow", "vanilla", "diffusion", "direct", "combined"],
+                           default="flow",
                            help="'flow' = FlowCEM; 'vanilla' = standard CEM; 'diffusion' = DDPM with guidance; "
-                                "'direct' = gradient descent on codons through full CNN (no latent stage)")
+                                "'direct' = gradient descent on codons through full CNN (no latent stage); "
+                                "'combined' = diffusion + inversion + direct refinement")
     cem_group.add_argument("--pop-size", type=int, default=512,
                            help="Candidates per iteration. Larger = better exploration, slower")
     cem_group.add_argument("--elite-frac", type=float, default=0.05,
@@ -402,24 +407,27 @@ def main():
             train_predictor(predictor, loader, loader, epochs=20, device=args.device)
 
     # ── Build objective ──────────────────────────────────────────────────
+    obj_mode = getattr(args, "obj_mode", "linear")
     if args.objective == "predictor" and predictor is not None:
         print(f"Objective: Predictor-based | target={target_name} ({target_cell_idx}) | "
-              f"off-target={off_target_names} | lam={args.lam}")
+              f"off-target={off_target_names} | lam={args.lam} | mode={obj_mode}")
         objective = PredictorSpecificityObjective(
             predictor=predictor,
             target_cell=target_cell_idx,
             off_target_cells=off_target_idxs,
             lam=args.lam,
             device=args.device,
+            obj_mode=obj_mode,
         )
     else:
         print(f"Objective: Direct RiboNN (latent) | target={target_name} ({target_cell_idx}) | "
-              f"off-target={off_target_names} | lam={args.lam}")
+              f"off-target={off_target_names} | lam={args.lam} | mode={obj_mode}")
         objective = LatentRiboNNObjective(
             wrapper=wrapper,
             target_col=target_cell_idx,
             off_target_cols=off_target_idxs,
             lam=args.lam,
+            obj_mode=obj_mode,
         )
 
     # ── Run optimization ─────────────────────────────────────────────────
@@ -428,7 +436,7 @@ def main():
     if args.optimizer == "direct":
         # Direct codon optimization: skip latent stage entirely
         print(f"\nOptimizer: DIRECT | steps={args.inversion_steps} | "
-              f"lr={args.inversion_lr}")
+              f"lr={args.inversion_lr} | repeats={args.n_repeats}")
 
         print("\n" + "=" * 60)
         print("Starting direct codon optimization...")
@@ -441,10 +449,14 @@ def main():
             cds_size=cds_size,
             utr3_size=utr3_len,
             cds_seq=cds_seq if cds_seq else None,
+            utr5_seq=utr5_seq if utr5_seq else None,
+            utr3_seq=utr3_seq if utr3_seq else None,
             target_col=target_cell_idx,
             off_target_cols=off_target_idxs,
             lam=args.lam,
+            obj_mode=obj_mode,
             n_steps=args.inversion_steps,
+            n_repeats=args.n_repeats,
             lr=args.inversion_lr,
             device=args.device,
         )
@@ -481,26 +493,16 @@ def main():
             )
             print(f"  Seed embedding norm: {init_mu.norm():.4f}")
 
-        if args.optimizer == "diffusion":
+        if args.optimizer in ("diffusion", "combined"):
             diff_steps = args.diffusion_steps or args.n_iters
-            print(f"\nOptimizer: DIFFUSION | batch={args.pop_size} | "
+            label = "COMBINED (diffusion → inversion → direct)" if args.optimizer == "combined" else "DIFFUSION"
+            print(f"\nOptimizer: {label} | batch={args.pop_size} | "
                   f"steps={diff_steps} | guidance={args.guidance_scale}")
         else:
             print(f"\nOptimizer: {args.optimizer.upper()} CEM | "
                   f"pop={args.pop_size} | elite={args.elite_frac} | iters={args.n_iters}")
 
-        if args.optimizer == "flow":
-            optimizer = FlowCEM(
-                dim=latent_dim,
-                pop_size=args.pop_size,
-                elite_frac=args.elite_frac,
-                n_iters=args.n_iters,
-                init_mu=init_mu,
-                schedule=args.schedule,
-                momentum=args.momentum,
-                device=args.device,
-            )
-        elif args.optimizer == "diffusion":
+        if args.optimizer in ("diffusion", "combined"):
             optimizer = DiffusionOptimizer(
                 dim=latent_dim,
                 batch_size=args.pop_size,
@@ -512,6 +514,17 @@ def main():
                 clip_grad_norm=args.clip_grad_norm,
                 proximity_weight=args.proximity_weight,
                 max_radius=args.max_radius,
+                device=args.device,
+            )
+        elif args.optimizer == "flow":
+            optimizer = FlowCEM(
+                dim=latent_dim,
+                pop_size=args.pop_size,
+                elite_frac=args.elite_frac,
+                n_iters=args.n_iters,
+                init_mu=init_mu,
+                schedule=args.schedule,
+                momentum=args.momentum,
                 device=args.device,
             )
         else:
@@ -550,10 +563,68 @@ def main():
             off_target_cols=off_target_idxs,
             obj_weight=args.obj_weight,
             lam=args.lam,
+            obj_mode=obj_mode,
             device=args.device,
         )
 
         inv_result = decoder.invert(result.best_z, verbose=True)
+
+        # ── Combined: direct refinement after inversion ──────────
+        if args.optimizer == "combined":
+            print("\n" + "=" * 60)
+            print("Stage 3: Direct codon refinement...")
+            print("=" * 60 + "\n")
+
+            # Use original CDS (protein preservation) + inverted UTRs
+            inv_seq = inv_result.sequence
+            inv_utr5 = inv_seq[:utr5_size] if utr5_size > 0 else ""
+            cds_for_direct = cds_seq if cds_seq else ""
+            inv_utr3 = inv_seq[utr5_size + cds_size:utr5_size + cds_size + utr3_len] if utr3_len > 0 else ""
+
+            # Build seed for direct optimizer from inverted UTRs + original CDS
+            direct_seed = inv_utr5 + cds_for_direct + inv_utr3
+            if direct_seed:
+                print(f"  Direct seed: {len(direct_seed)} nt "
+                      f"(UTR5={len(inv_utr5)}, CDS={len(cds_for_direct)}, UTR3={len(inv_utr3)})")
+
+            direct_opt = DirectOptimizer(
+                wrapper=wrapper,
+                seq_len=args.seq_len,
+                utr5_size=utr5_size,
+                cds_size=cds_size,
+                utr3_size=utr3_len,
+                cds_seq=cds_for_direct if cds_for_direct else None,
+                utr5_seq=inv_utr5 if inv_utr5 else None,
+                utr3_seq=inv_utr3 if inv_utr3 else None,
+                target_col=target_cell_idx,
+                off_target_cols=off_target_idxs,
+                lam=args.lam,
+                obj_mode=obj_mode,
+                n_steps=args.inversion_steps,
+                n_repeats=args.n_repeats,
+                lr=args.inversion_lr,
+                device=args.device,
+            )
+            direct_result = direct_opt.optimize(verbose=True)
+
+            # Replace inversion result with direct result
+            inv_result = InversionResult(
+                sequence=direct_result.sequence,
+                logits=direct_result.logits,
+                final_loss=-direct_result.best_score,
+                latent_distance=0.0,
+                loss_history=[],
+            )
+
+            # Update result to reflect the combined score
+            class _CombinedResultCompat:
+                def __init__(self, latent_result, dr):
+                    self.best_score = dr.best_score
+                    self.best_z = dr.best_z
+                    self.history = latent_result.history + dr.history
+            result = _CombinedResultCompat(result, direct_result)
+
+            print(f"\nCombined best specificity: {direct_result.best_score:.4f}")
 
     # ── Results ──────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -791,6 +862,7 @@ def main():
         "u_content": u_frac,
         "composition": counts,
         "obj_weight": args.obj_weight,
+        "obj_mode": obj_mode,
         "predictions": {
             "optimized": {ct_name: opt_te[ct_idx].item()
                           for ct_idx, ct_name in zip(all_cell_idxs, all_cell_names)},

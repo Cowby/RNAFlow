@@ -22,6 +22,7 @@ from torch import Tensor
 
 from rnaflow.data.encoding import decode_logits, sequence_entropy
 from rnaflow.data.codon_table import CODON_TO_AA, AA_TO_CODONS, NUC_IDX
+from rnaflow.optim.objective import _compute_specificity
 
 
 @dataclass
@@ -175,6 +176,7 @@ class GradientDecoder:
         off_target_cols: list[int] | None = None,
         obj_weight: float = 1.0,
         lam: float = 1.0,
+        obj_mode: str = "linear",
         device: str = "cpu",
     ):
         self.wrapper = wrapper
@@ -193,6 +195,7 @@ class GradientDecoder:
         self.off_target_cols = off_target_cols or []
         self.obj_weight = obj_weight
         self.lam = lam
+        self.obj_mode = obj_mode
         self.use_obj = target_col is not None and obj_weight > 0
         self.device = torch.device(device)
 
@@ -399,7 +402,10 @@ class GradientDecoder:
                 te = te.squeeze(0)  # (num_targets,)
                 target_te = te[self.target_col]
                 off_target_te = te[self.off_target_cols].mean()
-                specificity = target_te - self.lam * off_target_te
+                specificity = _compute_specificity(
+                    target_te.unsqueeze(0), off_target_te.unsqueeze(0),
+                    self.lam, self.obj_mode,
+                ).squeeze(0)
                 # Negate because we want to MAXIMIZE specificity
                 obj_loss = -specificity
 
