@@ -2,7 +2,10 @@
 
 **Flow-inspired latent space optimization of mRNA sequences for cell-type specificity.**
 
-RNAFlow uses [RiboNN](https://github.com/Sanofi-Public/RiboNN) pretrained embeddings and a flow-inspired Cross-Entropy Method (FlowCEM) to optimize mRNA sequences in a 64-dimensional latent space, maximizing translation efficiency in a target cell type while suppressing off-target expression. It also includes a **latent diffusion optimizer** that uses DDPM-style reverse diffusion with classifier guidance, exploiting gradients from the differentiable objective for potentially stronger optimization.
+RNAFlow uses [RiboNN](https://github.com/Sanofi-Public/RiboNN) pretrained embeddings to optimize mRNA sequences, maximizing translation efficiency in a target cell type while suppressing off-target expression. It offers two complementary optimization strategies:
+
+- **Latent space optimizers** (FlowCEM, Vanilla CEM, Diffusion): Explore RiboNN's 64-dim bottleneck space to discover globally optimal embeddings, then invert back to sequence via gradient descent. Best for holistic optimization — discovering structural motifs, avoiding problematic sequence patterns, and exploring the full landscape.
+- **Direct codon optimizer**: Skips latent space entirely and optimizes codon choices directly through the full CNN via `predict_with_grad`. Fast, targeted TE improvement from a seed sequence with guaranteed protein preservation.
 
 ## Overview
 
@@ -10,25 +13,26 @@ RNAFlow uses [RiboNN](https://github.com/Sanofi-Public/RiboNN) pretrained embedd
 Your mRNA (5'UTR + CDS + 3'UTR)
          │
          ▼
-    RiboNN encoder ──> 64-dim latent z  (= optimizer starting point)
+    RiboNN encoder ──> 64-dim latent z
                              │
-                    ┌────────┴────────┐
-               FlowCEM            Diffusion
-            (CEM + flow       (DDPM + classifier
-              schedule)          guidance)
-                    └────────┬────────┘
-                        optimized z*
-                             │
-                    gradient-based inversion
-                    (with codon labels from your CDS)
-                             │
-                    optimized mRNA sequence
+              ┌──────────────┼──────────────┐
+         FlowCEM         Diffusion        Direct
+      (CEM + flow    (DDPM + classifier   (gradient descent
+        schedule)       guidance)          on full CNN)
+              └──────┬───────┘              │
+              optimized z*                  │
+                   │                        │
+          gradient-based inversion          │
+          (codon labels from CDS)           │
+                   │                        │
+              optimized mRNA sequence ◄─────┘
 ```
 
-**Key idea:** Instead of optimizing over discrete nucleotide sequences directly, RNAFlow:
-1. Embeds your input mRNA into RiboNN's 64-dim bottleneck space
-2. Runs optimization (FlowCEM or latent diffusion) to find a latent vector z* that maximizes target-cell specificity
-3. Inverts z* back to a nucleotide sequence via gradient descent, using your CDS structure for proper codon labeling
+**Two optimization paths:**
+
+1. **Latent path** (FlowCEM / Diffusion): Embeds your mRNA into RiboNN's 64-dim bottleneck, optimizes the latent vector z* for target-cell specificity, then inverts z* back to a nucleotide sequence via gradient descent. Good for global exploration — structural motifs, holistic patterns, future constraint integration (e.g., motif removal, secondary structure optimization).
+
+2. **Direct path**: Starts from your seed sequence's codons and directly optimizes synonymous substitutions through the full CNN using `predict_with_grad`. No latent space, no inversion step. Fast and targeted — efficient TE improvement with guaranteed protein preservation.
 
 ## Installation
 
@@ -178,7 +182,7 @@ You provide your mRNA structure so that RNAFlow can (a) start optimization near 
 
 | Parameter | Default | What it does |
 |-----------|---------|--------------|
-| `--optimizer` | `flow` | **`flow`** (FlowCEM): Interpolates the sampling distribution from a broad prior toward the elite-fitted distribution using a time schedule. Better exploration-exploitation balance. **`vanilla`**: Standard CEM that immediately fits to elites each iteration. Faster convergence but more prone to getting stuck in local optima. **`diffusion`**: DDPM-style reverse diffusion with classifier guidance. Uses gradients from the differentiable objective to steer sampling — the only optimizer that exploits gradient information during latent space search. |
+| `--optimizer` | `flow` | **`flow`** (FlowCEM): Interpolates the sampling distribution from a broad prior toward the elite-fitted distribution using a time schedule. Better exploration-exploitation balance. **`vanilla`**: Standard CEM that immediately fits to elites each iteration. Faster convergence but more prone to getting stuck in local optima. **`diffusion`**: DDPM-style reverse diffusion with classifier guidance. Uses gradients from the differentiable objective to steer sampling. **`direct`**: Bypasses latent space entirely — optimizes codon choices directly through the full CNN. Fast, targeted, no inversion needed. See [Direct Optimizer](#direct-optimizer) below. |
 | `--pop-size` | `512` | Number of candidate latent vectors sampled per iteration. **Larger (1024+)**: Better coverage of latent space, less likely to miss good solutions. Costs linearly more compute per iteration. **Smaller (128)**: Faster iterations but noisier elite estimates. Good for quick exploration or when compute is limited. For 64-dim latent space, 256-512 is a good balance. |
 | `--elite-frac` | `0.05` | Fraction of top-scoring samples used to update the distribution. With pop_size=512 and elite_frac=0.05, the top 25 samples are kept. **Smaller (0.01-0.02)**: More selective, faster convergence, but risks losing diversity. **Larger (0.1-0.2)**: More conservative, maintains diversity, slower convergence. If optimization plateaus early, try increasing this. |
 | `--n-iters` | `200` | Number of CEM iterations. Each iteration samples, evaluates, and updates. **50-100**: Quick exploration, good for testing. **200-300**: Standard runs, usually sufficient for convergence. **500+**: Diminishing returns unless the objective landscape is very rugged. Watch the optimization plot: if the score plateaus, more iterations won't help. |
@@ -199,9 +203,26 @@ These parameters are only used when `--optimizer diffusion`. The `--pop-size` an
 | `--proximity-weight` | `0.1` | Penalizes `\|\|z - seed\|\|² / dim` during guidance, preventing drift into unrealistic latent regions where the head_tail extrapolates linearly but inversion fails. **0**: Disabled (can cause overshoot). **0.1** (default): Good balance. **0.5+**: Conservative, stays very close to seed. |
 | `--max-radius` | `50.0` | Hard distance clamp from seed embedding. Samples beyond this radius are projected back. Acts as a safety net. **0**: Disabled. **50** (default): Matches typical FlowCEM exploration range. |
 
+### Direct Optimizer
+
+These parameters are used when `--optimizer direct`. The direct optimizer skips latent space optimization and gradient inversion entirely — it optimizes codon choices directly through the full CNN.
+
+| Parameter | Default | What it does |
+|-----------|---------|--------------|
+| `--n-iters` | `500` | Number of gradient descent steps on codon logits. **50-100**: Quick test. **200-500**: Standard. The direct optimizer typically converges faster than latent+inversion since it has fewer degrees of freedom (synonymous codons only). |
+| `--inversion-lr` | `0.05` | Learning rate for the Adam optimizer on codon and UTR logits. Same parameter as inversion since it serves the same role. |
+| `--lam` | `1.0` | Off-target penalty weight. Same semantics as for latent optimizers. |
+
+The direct optimizer uses exponential temperature annealing (Gumbel-softmax with straight-through estimator) to transition from soft to hard codon selections during optimization. CDS codons are constrained to synonymous substitutions, guaranteeing protein preservation. UTR regions are optimized freely.
+
+**When to use direct vs latent optimizers:**
+- **Direct**: When you want fast, targeted TE improvement from a known seed sequence. Best for codon optimization where the overall mRNA structure is already good.
+- **Latent (FlowCEM/Diffusion)**: When you want global exploration — discovering new structural motifs, optimizing holistic properties, or when future constraints (motif removal, secondary structure) need to be integrated.
+- **Both**: Run direct first for a quick baseline, then latent optimizers for further exploration. Or compare results to build confidence.
+
 ### Gradient Inversion (z* -> sequence)
 
-After CEM finds the optimal latent vector z*, gradient inversion recovers the corresponding nucleotide sequence by optimizing soft logits through the RiboNN encoder.
+After latent optimization (FlowCEM, Vanilla CEM, or Diffusion) finds the optimal latent vector z*, gradient inversion recovers the corresponding nucleotide sequence by optimizing soft logits through the RiboNN encoder. **Not used with `--optimizer direct`.**
 
 | Parameter | Default | What it does |
 |-----------|---------|--------------|
@@ -246,6 +267,7 @@ RNAFlow/
 │   │   ├── cem.py               # Vanilla CEM baseline
 │   │   ├── flow_cem.py          # Flow-inspired CEM (core novelty)
 │   │   ├── diffusion.py         # Latent diffusion optimizer (DDPM + classifier guidance)
+│   │   ├── direct.py            # Direct codon optimizer (bypass latent space)
 │   │   └── objective.py         # Specificity objective functions
 │   └── utils/
 │       └── config.py            # YAML config loader
@@ -256,7 +278,7 @@ RNAFlow/
 ├── configs/
 │   ├── optimize.yaml            # Optimization config
 │   └── predictor.yaml           # Predictor training config
-└── tests/                       # 50+ unit tests
+└── tests/                       # 57 unit tests
 ```
 
 ### How RiboNN Embeddings Work
@@ -364,7 +386,7 @@ done
 - **sqrt**: Better when seeded from a known good sequence. Exploits quickly.
 - **linear**: Simple baseline. Uniform transition.
 
-### FlowCEM vs Vanilla CEM vs Diffusion
+### FlowCEM vs Vanilla CEM vs Diffusion vs Direct
 
 ```bash
 # FlowCEM (gradient-free, population-based with flow schedule)
@@ -387,9 +409,25 @@ python scripts/optimize.py \
   --target-cell HeLa --off-target-cells HEK293T K562 \
   --optimizer diffusion --guidance-scale 10.0 \
   --n-iters 200 --output-dir results/diffusion
+
+# Direct (gradient-based codon optimization, bypasses latent space)
+python scripts/optimize.py \
+  --utr5 "..." --cds "AUG...UAA" --utr3 "..." \
+  --target-cell HeLa --off-target-cells HEK293T K562 \
+  --optimizer direct \
+  --n-iters 500 --output-dir results/direct
 ```
 
-**FlowCEM** typically outperforms vanilla CEM because the gradual transition avoids premature convergence. **Diffusion** is the only optimizer that uses gradient information from the objective during latent space search, which can provide stronger signal in the 64-dim space — especially when the objective landscape has multiple modes or sharp ridges.
+**Optimizer comparison:**
+
+| Optimizer | Strategy | Latent space? | Inversion? | Strengths |
+|-----------|----------|---------------|------------|-----------|
+| **FlowCEM** | Population-based, flow schedule | Yes | Yes | Smooth exploration-to-exploitation, good general purpose |
+| **Vanilla CEM** | Population-based, immediate elite fit | Yes | Yes | Fast convergence, simple |
+| **Diffusion** | DDPM + classifier guidance | Yes | Yes | Gradient-guided latent search, strong in multimodal landscapes |
+| **Direct** | Gradient descent on codon logits | No | No | Fast, targeted, protein preserved, no latent extrapolation risk |
+
+**FlowCEM** typically outperforms vanilla CEM because the gradual transition avoids premature convergence. **Diffusion** uses gradient information during latent space search, providing stronger signal when the objective landscape has multiple modes. **Direct** is complementary — it skips the latent bottleneck entirely and optimizes codons through the full CNN, avoiding the extrapolation issues that can arise when the target z* lies outside the training distribution. Direct is best for targeted codon optimization; latent optimizers are best for global exploration where future constraints (motif removal, secondary structure) may be integrated.
 
 ### Aggressive off-target suppression
 
@@ -529,6 +567,7 @@ Example `results.json`:
 pytest tests/ -v                                    # all tests
 pytest tests/test_flow_cem.py -v                    # CEM optimizer tests
 pytest tests/test_diffusion.py -v                   # diffusion optimizer tests
+pytest tests/test_direct.py -v                      # direct codon optimizer tests
 pytest tests/test_ensemble.py -v                    # ensemble wrapper tests
 pytest tests/ --cov=rnaflow --cov-report=term-missing  # with coverage
 ```
@@ -549,7 +588,7 @@ target_cell: HeLa
 off_target_cells: [HEK293T, K562, A549, MCF7]
 lam: 1.0
 
-optimizer: flow                  # 'flow', 'vanilla', or 'diffusion'
+optimizer: flow                  # 'flow', 'vanilla', 'diffusion', or 'direct'
 pop_size: 512
 elite_frac: 0.05
 n_iters: 200
